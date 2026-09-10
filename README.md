@@ -48,6 +48,31 @@ settings survive every update.
 - Offline or GitHub unreachable: it says so and starts the version you have.
 - Set the environment variable `REVAUDIT_NO_UPDATE` to any value to turn it off.
 
+### Windows: install with Scoop
+
+```powershell
+scoop bucket add sergioalexo https://github.com/sergioalexo/scoop-bucket
+scoop install revaudit
+```
+
+This pulls in Python if you don't have it and puts four commands on your PATH:
+`revaudit` (CLI), `revaudit-serve` (single-user web UI), `revaudit-oauth`
+(multi-user app), and `revaudit-launch` (the double-click launcher).
+
+Your `.env` and `revaudit.conf` are **persisted** by Scoop — `scoop update revaudit`
+replaces the code but leaves your API key, folders and port alone. First install
+seeds both files from the templates and points `[folders] report` at a persisted
+folder so audit history survives updates too.
+
+```powershell
+scoop prefix revaudit   # open this folder, put your Onshape key in .env
+revaudit-serve
+```
+
+The git-clone method above and the Scoop package are independent — pick one per
+machine. Under Scoop, `scoop update` is the update path (`launch.bat`'s own
+git auto-update notices there's no `.git` and skips itself).
+
 ### Any OS: by hand
 
 1. Create an API key at <https://dev-portal.onshape.com> → **API keys** → **Create new
