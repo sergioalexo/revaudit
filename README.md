@@ -379,6 +379,10 @@ names the folder the index came from, so you can tell which was used.
 `--out dxf-index.json` writes the index to a file instead of uploading, if you
 would rather move it by other means.
 
+## License
+
+GPL-3.0 — see [LICENSE](LICENSE). Copyright (C) 2026 Sergio Alexo.
+
 ---
 
 RevAudit is developed by [Sergio Alexo](https://sergioalexo.com).
