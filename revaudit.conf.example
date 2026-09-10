@@ -1,0 +1,54 @@
+# RevAudit configuration
+#
+# Plain text. Open it in Notepad, change what you need, save, then restart
+# RevAudit (close its window and start it again from the Desktop shortcut).
+#
+# This file is only for settings that are safe to read. Passwords and Onshape
+# API keys live in the .env file, not here.
+
+
+[network]
+
+# The address people type into their browser to reach RevAudit.
+#
+#   - Leave this blank to auto-detect. RevAudit then prints every address it
+#     could be reached at when it starts up.
+#   - Once this machine has a fixed address (a DHCP reservation on the router,
+#     or a static IP), put that address here so the startup message always
+#     shows the right one.
+#
+# NOTE: this machine's IP can change on its own if it uses DHCP. If RevAudit
+# suddenly "stops working" for coworkers, a changed IP is the first thing to
+# check - look at the address in RevAudit's window and compare it to this.
+advertised_address =
+
+# What the server listens on:
+#   0.0.0.0   - reachable from other machines on the network
+#               (a password in .env is required for this)
+#   127.0.0.1 - this machine only
+bind_host = 0.0.0.0
+
+port = 8000
+
+
+[folders]
+
+# Where the production files live, for the DXF / SAT / PDF / STEP checks and
+# exports. Leave a line blank to turn that check off by default in the web
+# form (people can still fill it in per run).
+#
+# A UNC path ( \\server\share\folder ) keeps working when RevAudit starts
+# automatically at logon. A mapped drive letter ( K: ) only works while you
+# are signed in to this machine - fine for now, worth knowing later.
+dxf  =
+sat  =
+pdf  =
+step =
+
+# Where finished HTML reports are saved, so anyone with drive access can
+# browse the audit history. Set it blank to keep reports in the RevAudit
+# app folder instead. If this folder can't be reached when a report is
+# written, RevAudit falls back to the app folder for that one.
+#
+# Example: report = \\server\share\RevAudit Reports
+report =

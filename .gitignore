@@ -1,0 +1,13 @@
+.env
+access.txt
+revaudit-*.html
+__pycache__/
+*.pyc
+dxf-index.json
+env.txt
+*.txt
+*.log
+file-index-*.json
+drawings/
+revaudit.conf
+banner*.txt
