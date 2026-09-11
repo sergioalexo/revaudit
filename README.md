@@ -27,8 +27,10 @@ computers on the network to reach it). It:
 
 - finds your Python and checks the version
 - creates `revaudit.conf` (plain-text settings) and `.env` (secrets) from templates
-- puts a **RevAudit** shortcut on your Desktop and one in Startup so it comes back
-  after a reboot
+- puts a **RevAudit** shortcut on your Desktop
+- asks whether RevAudit should **start with Windows** (a shortcut in your Startup
+  folder, so it comes back after a reboot) — change your mind any time with
+  `autostart.bat` (`on` / `off` / `status`, or double-click it to toggle)
 - opens the firewall for port 8000 (the admin part)
 - opens `revaudit.conf` in Notepad so you can set the address and folders
 
@@ -264,7 +266,8 @@ the download link, so nobody has to remember this paragraph.
 | `config.py` | Reads `revaudit.conf` — port, address, folder paths |
 | `test_audit.py` | Offline tests — mock client, no network or credentials needed |
 | `dxf_indexer.py` | Publishes a DXF/SAT filename index to a host that cannot see the share |
-| `install.bat` | Windows setup — config, shortcuts, Startup entry, firewall |
+| `install.bat` | Windows setup — config, shortcuts, optional Startup entry, firewall |
+| `autostart.bat` | Turns "start RevAudit when I log in" on or off (`on` / `off` / `status`) |
 | `launch.bat` / `_open_browser.bat` | Double-click launcher for `serve.py`; auto-updates from GitHub on start |
 | `revaudit.conf.example` | Template for the plain-text settings file |
 

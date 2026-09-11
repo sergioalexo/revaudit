@@ -58,17 +58,20 @@ if exist "%USERPROFILE%\Desktop\RevAudit.lnk" (
   echo   [--] Could not create the Desktop shortcut  ^(not fatal^)
 )
 
-rem ---------- 5. start automatically when you log in (no admin needed) ----------
+rem ---------- 5. start automatically when you log in (optional, no admin needed) ----------
+rem   Re-running the installer keeps whatever you chose last time; change it any
+rem   time with  autostart.bat  (on / off).
 set STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
-powershell -NoProfile -Command ^
-  "$w=New-Object -ComObject WScript.Shell;" ^
-  "$s=$w.CreateShortcut('%STARTUP%\RevAudit.lnk');" ^
-  "$s.TargetPath='%~dp0launch.bat';$s.WorkingDirectory='%~dp0';" ^
-  "$s.WindowStyle=7;$s.IconLocation='shell32.dll,13';$s.Description='Start RevAudit at logon';$s.Save()" >nul 2>nul
 if exist "%STARTUP%\RevAudit.lnk" (
-  echo   [OK] Auto-start:  RevAudit will start ^(minimised^) when you log in
+  echo   [OK] Auto-start:  already on  -  run autostart.bat to change it
 ) else (
-  echo   [--] Could not set up auto-start  ^(not fatal - use the Desktop shortcut^)
+  echo.
+  choice /c YN /n /m "   Start RevAudit automatically when you log in to Windows? [Y/N] "
+  if errorlevel 2 (
+    echo   [--] Auto-start:  off  -  run autostart.bat later if you change your mind
+  ) else (
+    call "%~dp0autostart.bat" on
+  )
 )
 
 rem ---------- 6. firewall rule (needs admin) ----------
@@ -99,6 +102,7 @@ if "!ADMIN!"=="0" (
   echo.
 )
 echo    Start RevAudit any time from the  RevAudit  shortcut on your Desktop.
+echo    Turn "start with Windows" on or off with  autostart.bat
 echo    Change the IP address or folders in  revaudit.conf  ^(plain text^).
 echo   ------------------------------------------------
 echo.
