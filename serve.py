@@ -24,6 +24,7 @@ import secrets
 import shutil
 import sys
 import threading
+import time
 import traceback
 import webbrowser
 from datetime import datetime
@@ -155,9 +156,14 @@ def index_file_path(name):
     return HERE / f"file-index-{name.lower()}.json"
 
 
-# Indexing a network folder takes ~15s, so keep it between runs.
+# Indexing a network folder takes ~15s, so keep it between runs - but only
+# while the folder is unchanged. Each entry remembers the folder's mtime at
+# scan time (any file added or removed in the top level bumps it) and its
+# age; it is rescanned when either says the list may be stale. Without this
+# a DXF saved after RevAudit started stayed invisible until the next restart.
 _index_cache = {}
 _index_lock = threading.Lock()
+INDEX_MAX_AGE = 10 * 60          # seconds; also catches changes in subfolders
 _run_lock = threading.Lock()
 
 
@@ -180,13 +186,28 @@ def load_uploaded_index(name, extensions=(".dxf",)):
     )
 
 
+def _folder_mtime(folder):
+    try:
+        return os.stat(folder).st_mtime
+    except OSError:
+        return None
+
+
 def get_file_index(name, folder, recursive, extensions=(".dxf",)):
     """Scan the folder live; fall back to an uploaded index when this host
     cannot see the share (the usual case for a remote deployment)."""
     key = (name, str(folder), bool(recursive))
+    mtime = _folder_mtime(folder)
     with _index_lock:
-        if key in _index_cache:
-            return _index_cache[key]
+        hit = _index_cache.get(key)
+    if hit is not None:
+        index, scanned_at, seen_mtime = hit
+        fresh = time.time() - scanned_at < INDEX_MAX_AGE
+        # an uploaded index is only ever a stand-in - retry the folder each
+        # time so it takes over as soon as the share becomes reachable
+        if (fresh and mtime is not None and mtime == seen_mtime
+                and index.source == "scanned live"):
+            return index
     try:
         index = FileIndex(folder, recursive, extensions)
     except OnshapeError:
@@ -194,11 +215,10 @@ def get_file_index(name, folder, recursive, extensions=(".dxf",)):
         if index is None:
             raise
     with _index_lock:
-        _index_cache[key] = index
+        _index_cache[key] = (index, time.time(), mtime)
     return index
 
 
-# kept for anything still calling the pre-multi-check name
 def get_dxf_index(folder, recursive):
     return get_file_index("DXF", folder, recursive, (".dxf",))
 
