@@ -82,12 +82,14 @@ class MockClient:
     def __init__(self, drift=False):
         self.drift = drift
         self.call_count = 0
+        self.bom_configurations = []
 
     def revisions(self, cid, pn, element_type):
         self.call_count += 1
         if pn == "ASM-TEST" and element_type == 1:
             return [{"documentId": "D", "documentName": "TESTDOC", "elementId": "E",
                      "versionId": "V", "revision": "A", "isObsolete": False,
+                     "configuration": "List_x=STEEL",
                      "releaseCreatedDate": "2026-08-25T00:00:00.000+00:00"}]
         if pn == "ASM-TEST" and element_type == 2:
             return [{"revision": "A", "isObsolete": False, "documentId": "D",
@@ -107,7 +109,10 @@ class MockClient:
     def document(self, did):
         return {"defaultWorkspace": {"id": "W"}}
 
-    def bom(self, did, wv, wvid, eid):
+    def bom(self, did, wv, wvid, eid, configuration=None):
+        # the audit must ask for the released configuration, otherwise parts
+        # that configuration suppresses leak in from the default one
+        self.bom_configurations.append(configuration)
         if wv == "w" and self.drift:
             rows = list(VERSION_BOM["rows"])[:-1]
             return {"headers": VERSION_BOM["headers"], "rows": rows}
@@ -216,6 +221,9 @@ def main():
           "PRT-100" in [m["pn"] for m in f["files"]["SAT"]["missing"]], False)
 
     check("workspace drift (same)", f["workspaceDrift"]["drifted"], False)
+    check("released configuration carried", res["assembly"]["configuration"], "List_x=STEEL")
+    check("BOMs fetched for released configuration", client.bom_configurations,
+          ["List_x=STEEL", "List_x=STEEL"])
 
     print("\nsafe_filename")
     check("strips illegal chars", safe_filename('PRT-1/2:3*4?"5<6>7|8'), "PRT-1_2_3_4_5_6_7_8")

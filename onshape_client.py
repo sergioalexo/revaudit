@@ -177,11 +177,15 @@ class OnshapeClient:
     def document(self, did):
         return self.get(f"/api/v6/documents/{did}")
 
-    def bom(self, did, wv, wvid, eid):
-        return self.get(
-            f"/api/v6/assemblies/d/{did}/{wv}/{wvid}/e/{eid}/bom",
-            {"indented": "false", "multiLevel": "true", "generateIfAbsent": "true"},
-        )
+    def bom(self, did, wv, wvid, eid, configuration=None):
+        """configuration is the encoded string a revision record carries
+        (e.g. "HEIGHT=1.016+meter;List_x=STEEL"). Without it Onshape
+        returns the BOM of the default configuration, which can list parts
+        the released configuration suppresses."""
+        params = {"indented": "false", "multiLevel": "true", "generateIfAbsent": "true"}
+        if configuration:
+            params["configuration"] = configuration
+        return self.get(f"/api/v6/assemblies/d/{did}/{wv}/{wvid}/e/{eid}/bom", params)
 
 
 # --------------------------------------------------------------------------

@@ -443,11 +443,16 @@ def with_back_link(report_html, saved_name, share_url=None):
             f"<button type='button' onclick='copyShareUrl()'>Copy link</button>"
             f"<span id='copied' style='color:var(--ok);font-size:12.5px;display:none'>"
             f"copied</span></div>"
+            # navigator.clipboard is undefined on a plain-http LAN address
+            # (not a secure context), so fall back to execCommand there
             "<script>function copyShareUrl(){"
             "const el=document.getElementById('shareUrl');el.select();"
-            "navigator.clipboard.writeText(el.value).then(()=>{"
-            "const c=document.getElementById('copied');c.style.display='inline';"
-            "setTimeout(()=>c.style.display='none',1500);});}</script>"
+            "const done=()=>{const c=document.getElementById('copied');"
+            "c.style.display='inline';setTimeout(()=>c.style.display='none',1500);};"
+            "const legacy=()=>{try{document.execCommand('copy');}catch(e){}done();};"
+            "if(navigator.clipboard&&window.isSecureContext){"
+            "navigator.clipboard.writeText(el.value).then(done,legacy);}else{legacy();}}"
+            "</script>"
         )
     bar = (
         f"<style>{SHARE_CSS}</style>"

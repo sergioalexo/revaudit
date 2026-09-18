@@ -147,6 +147,17 @@ footer{margin-top:56px;padding-top:18px;border-top:1px solid var(--line);
 """
 
 
+def pretty_configuration(encoded):
+    """'HEIGHT=1.016+meter;List_7yos=STEEL' -> 'HEIGHT=1.016 meter, STEEL'.
+    List_* keys are opaque Onshape ids, so only their values are shown."""
+    parts = []
+    for item in (encoded or "").split(";"):
+        key, _, val = item.partition("=")
+        val = val.replace("+", " ")
+        parts.append(val if key.startswith("List_") else f"{key}={val}" if val else key)
+    return ", ".join(p for p in parts if p)
+
+
 def esc(value):
     if value is None:
         return ""
@@ -204,7 +215,9 @@ def render_assembly(result):
         f'<span>Released <b>{esc(asm["releaseDate"] or "-")}</b></span>'
         f'<span>Assembly drawing <b>{esc(dwg or "none")}</b></span>'
         f'<span>Source <b>{esc(result.get("bomSource", ""))}</b></span>'
-        "</div>"
+        + (f'<span>Configuration <b>{esc(pretty_configuration(asm["configuration"]))}</b></span>'
+           if asm.get("configuration") else "")
+        + "</div>"
     )
 
     f = result.get("findings", {})

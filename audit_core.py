@@ -108,6 +108,9 @@ def resolve_assembly(client, company_id, part_number):
         "documentName": chosen.get("documentName"),
         "elementId": chosen.get("elementId"),
         "versionId": chosen.get("versionId"),
+        # the configuration that was released - the BOM must be fetched for
+        # it, or suppressed parts from the default configuration leak in
+        "configuration": chosen.get("configuration") or None,
         "revision": chosen.get("revision"),
         "obsolete": bool(chosen.get("isObsolete")),
         "releaseDate": (chosen.get("releaseCreatedDate") or "")[:10],
@@ -177,7 +180,8 @@ def audit_assembly(client, company_id, asm_pn, file_checks=None,
         return result
     result["assembly"] = asm
 
-    payload = client.bom(asm["documentId"], "v", asm["versionId"], asm["elementId"])
+    payload = client.bom(asm["documentId"], "v", asm["versionId"], asm["elementId"],
+                         asm["configuration"])
     rows = normalize_bom(payload)
     if not rows:
         result["errors"].append("The released version returned an empty BOM.")
@@ -197,7 +201,8 @@ def audit_assembly(client, company_id, asm_pn, file_checks=None,
         wsid = (doc.get("defaultWorkspace") or {}).get("id")
         if wsid:
             ws_rows = normalize_bom(
-                client.bom(asm["documentId"], "w", wsid, asm["elementId"])
+                client.bom(asm["documentId"], "w", wsid, asm["elementId"],
+                           asm["configuration"])
             )
             if ws_rows:
                 ws_counts = {}
