@@ -783,8 +783,78 @@ def export_step_for(results, client, host, step_dir, force=False):
 
 SERVER_STATE = {}
 
+# Everything the console shows is also appended here, so a server that died
+# overnight in a minimised window can still be diagnosed the next morning.
+LOG_PATH = HERE / "revaudit.log"
+LOG_KEEP = 512 * 1024          # bytes retained when the file grows past 4x this
+
+
+class _Tee:
+    """Writes to the console and the log file; a broken console (closed
+    window, redirected handle) never takes the server down with it."""
+
+    def __init__(self, console, log_file):
+        self.console = console
+        self.log_file = log_file
+        self.lock = threading.Lock()
+
+    def write(self, text):
+        for stream in (self.console, self.log_file):
+            try:
+                with self.lock:
+                    stream.write(text)
+                    stream.flush()
+            except (OSError, ValueError):
+                pass
+        return len(text)
+
+    def flush(self):
+        for stream in (self.console, self.log_file):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+
+    def isatty(self):
+        return False
+
+
+def open_log():
+    """Append to revaudit.log, trimming it to the newest LOG_KEEP bytes when
+    it has grown large. Returns None (console only) if the file can't be
+    written - a log must never be the reason the server won't start."""
+    try:
+        if LOG_PATH.is_file() and LOG_PATH.stat().st_size > 4 * LOG_KEEP:
+            tail = LOG_PATH.read_bytes()[-LOG_KEEP:]
+            LOG_PATH.write_bytes(tail[tail.find(b"\n") + 1:])
+        return open(LOG_PATH, "a", encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
 
 def main(argv=None):
+    log_file = open_log()
+    if log_file is not None:
+        sys.stdout = _Tee(sys.stdout, log_file)
+        sys.stderr = _Tee(sys.stderr, log_file)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n=== {APP_NAME} starting {stamp}  (pid {os.getpid()}) ===", file=sys.stderr)
+    try:
+        return _main(argv)
+    except SystemExit:
+        raise
+    except BaseException as exc:                              # noqa: BLE001
+        # KeyboardInterrupt included: the log says *why* the server is gone.
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"=== {APP_NAME} died {stamp}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        traceback.print_exc()
+        raise
+    finally:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"=== {APP_NAME} stopped {stamp} ===", file=sys.stderr)
+
+
+def _main(argv):
     parser = argparse.ArgumentParser(description="RevAudit web UI")
     parser.add_argument("--port", type=int, default=None,
                         help="overrides revaudit.conf")
@@ -833,7 +903,13 @@ def main(argv=None):
         )
         return 2
 
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    try:
+        httpd = ThreadingHTTPServer((host, port), Handler)
+    except OSError as exc:
+        print(f"Could not listen on {host}:{port}: {exc}\n"
+              "Is another RevAudit (or something else) already using that port?",
+              file=sys.stderr)
+        return 2
     httpd.base_url = base_url
     httpd.password = password
 

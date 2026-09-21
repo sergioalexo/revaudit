@@ -32,6 +32,11 @@ computers on the network to reach it). It:
 - asks whether RevAudit should **start with Windows** (a shortcut in your Startup
   folder, so it comes back after a reboot) — change your mind any time with
   `autostart.bat` (`on` / `off` / `status`, or double-click it to toggle)
+- optionally, `autostart.bat keepalive on` adds a scheduled task that checks every
+  10 minutes and restarts RevAudit if it has stopped. The logon shortcut only fires
+  when you log on; a session that stays signed in (just locked) for days and loses
+  RevAudit to a closed window or a crash stays without it otherwise. The check is
+  windowless and does nothing while the server is up.
 - opens the firewall for port 8000 (the admin part)
 - opens `revaudit.conf` in Notepad so you can set the address and folders
 
@@ -45,6 +50,16 @@ reboot, via the Startup shortcut). When `origin` is one or more commits ahead it
 fast-forwards to the latest code and relaunches itself before starting the server.
 `revaudit.conf` and `.env` are never touched — they're git-ignored, so your local
 settings survive every update.
+
+### When it "didn't start"
+
+Two log files in the app folder, both git-ignored:
+
+- `launch.log` — one line per `launch.bat` run: when it started, whether it pulled an
+  update, whether Python or `.env` was missing, and the exit code when `serve.py`
+  stopped. Keep-alive checks that found the server running are not logged.
+- `revaudit.log` — everything the server printed (the startup banner, the request
+  log, tracebacks), with a timestamped `starting` / `died` / `stopped` line per run.
 
 - It only ever fast-forwards. If you've edited a tracked file locally the pull is
   skipped and your version keeps running.
@@ -325,7 +340,8 @@ the download link, so nobody has to remember this paragraph.
 | `test_audit.py` | Offline tests — mock client, no network or credentials needed |
 | `dxf_indexer.py` | Publishes a DXF/SAT filename index to a host that cannot see the share |
 | `install.bat` | Windows setup — config, shortcuts, optional Startup entry, firewall |
-| `autostart.bat` | Turns "start RevAudit when I log in" on or off (`on` / `off` / `status`) |
+| `autostart.bat` | Turns "start RevAudit when I log in" on or off (`on` / `off` / `status`); `keepalive on` / `off` adds or removes the every-10-minutes restart task |
+| `keepalive.vbs` | What the keep-alive task runs: starts `launch.bat --quiet` with no console window |
 | `launch.bat` / `_open_browser.bat` | Double-click launcher for `serve.py`; auto-updates from GitHub on start |
 | `revaudit.conf.example` | Template for the plain-text settings file |
 
