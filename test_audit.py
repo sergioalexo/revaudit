@@ -3,12 +3,17 @@
     py -3.13 test_audit.py
 """
 
+import json
 import re
 import sys
+import tempfile
+from pathlib import Path
 
 from audit_core import audit_assembly
-from pdf_export import _collect_jobs, safe_filename
-from onshape_client import normalize_bom, rev_lt
+from pdf_export import (_collect_jobs, export_assembly_drawings,
+                        export_assembly_step_file, export_counts, safe_filename)
+from onshape_client import OnshapeError, normalize_bom, rev_lt
+from revaudit import build_report, load_report, render_data, save_report
 
 # --------------------------------------------------------------------------
 # a mock Onshape backend shaped exactly like the real payloads
@@ -25,7 +30,10 @@ TUBE = "TUBE ALUMINUM"
 def bom_row(item, pn, name, rev, state, qty, material):
     return {"headerIdToValue": {
         "h1": item, "h2": pn, "h3": name, "h4": rev,
-        "h5": state, "h6": qty, "h7": material}}
+        "h5": state, "h6": qty, "h7": material},
+        # what Onshape attaches to every BOM line: where that exact item lives
+        "itemSource": {"viewHref": f"https://cad.example/documents/D/v/V-{pn}-{rev}/e/E"
+                                   f"?configuration=default"}}
 
 
 VERSION_BOM = {
@@ -90,10 +98,13 @@ class MockClient:
             return [{"documentId": "D", "documentName": "TESTDOC", "elementId": "E",
                      "versionId": "V", "revision": "A", "isObsolete": False,
                      "configuration": "List_x=STEEL",
+                     "viewRef": "https://cad.example/documents/D/v/V/e/E"
+                                "?configuration=List_x%3DSTEEL",
                      "releaseCreatedDate": "2026-08-25T00:00:00.000+00:00"}]
         if pn == "ASM-TEST" and element_type == 2:
             return [{"revision": "A", "isObsolete": False, "documentId": "D",
-                     "versionId": "V-asm-dwg", "elementId": "E-asm-dwg"}]
+                     "versionId": "V-asm-dwg", "elementId": "E-asm-dwg",
+                     "viewRef": "https://cad.example/documents/D/v/V-asm-dwg/e/E-asm-dwg"}]
         table = PART_REVS if element_type == 0 else DRAWING_REVS if element_type == 2 else {}
         revs = table.get(pn, [])
         # drawing revisions (element_type 2) carry ids so PDF export has
@@ -101,9 +112,11 @@ class MockClient:
         # them since only drawings get exported.
         if element_type == 2:
             return [{"revision": r, "isObsolete": i > 0, "documentName": "SRC",
-                     "documentId": "D", "versionId": f"V-{pn}-{r}", "elementId": f"E-{pn}"}
+                     "documentId": "D", "versionId": f"V-{pn}-{r}", "elementId": f"E-{pn}",
+                     "viewRef": f"https://cad.example/documents/D/v/V-{pn}-{r}/e/E-{pn}"}
                     for i, r in enumerate(revs)]
-        return [{"revision": r, "isObsolete": i > 0, "documentName": "SRC"}
+        return [{"revision": r, "isObsolete": i > 0, "documentName": "SRC",
+                 "viewRef": f"https://cad.example/documents/D/v/V-{pn}-{r}/e/P-{pn}"}
                 for i, r in enumerate(revs)]
 
     def document(self, did):
@@ -203,7 +216,7 @@ def main():
     check("dxf expected count", f["files"]["DXF"]["expected"], 5)
     check("wood not expected to have dxf",
           "PRT-104" in [m["pn"] for m in f["files"]["DXF"]["missing"]], False)
-    check("dxf back-compat alias", f["dxf"] is f["files"]["DXF"], True)
+    check("no duplicate dxf alias in the saved data", "dxf" in f, False)
 
     dxf_multi = f["files"]["DXF"]["multiple"]
     check("dxf 'multiple' flags PRT-102", [m["pn"] for m in dxf_multi], ["PRT-102"])
@@ -248,6 +261,114 @@ def main():
           any(j["kind"] == "assembly" and j["pn"] == "ASM-TEST" for j in jobs), True)
     check("part job carries real ids",
           [j for j in jobs if j["pn"] == "PRT-100"][0]["ids"]["elementId"], "E-PRT-100")
+
+    print("\nOnshape links carried through")
+    check("assembly url is the released version + configuration",
+          res["assembly"]["url"],
+          "https://cad.example/documents/D/v/V/e/E?configuration=List_x%3DSTEEL")
+    check("assembly drawing url", res["assembly"]["drawingUrl"],
+          "https://cad.example/documents/D/v/V-asm-dwg/e/E-asm-dwg")
+    check("part status has part + drawing urls at their current revs",
+          (res["partStatuses"]["PRT-103"]["partUrl"],
+           res["partStatuses"]["PRT-103"]["drawingUrl"]),
+          ("https://cad.example/documents/D/v/V-PRT-103-C/e/P-PRT-103",
+           "https://cad.example/documents/D/v/V-PRT-103-B/e/E-PRT-103"))
+    check("BOM row url comes from itemSource", res["rows"][0]["url"],
+          "https://cad.example/documents/D/v/V-PRT-100-A/e/E?configuration=default")
+    check("no-drawing entry links the part", f["noDrawing"][0]["partUrl"],
+          "https://cad.example/documents/D/v/V-PRT-104-A/e/P-PRT-104")
+    check("drawing-behind entry links both",
+          (f["drawingBehindPart"][0]["partUrl"], f["drawingBehindPart"][0]["drawingUrl"]),
+          ("https://cad.example/documents/D/v/V-PRT-103-C/e/P-PRT-103",
+           "https://cad.example/documents/D/v/V-PRT-103-B/e/E-PRT-103"))
+    check("mixed-rev lines each link their own BOM line",
+          [l["url"] for l in f["duplicatePartNumbers"][0]["lines"]],
+          ["https://cad.example/documents/D/v/V-PRT-100-A/e/E?configuration=default",
+           "https://cad.example/documents/D/v/V-PRT-100-B/e/E?configuration=default"])
+    check("obsolete line links its BOM line", bool(f["obsoleteLines"][0]["url"]), True)
+    check("unmanaged line links its BOM line", bool(f["notRevisionManaged"][0]["url"]), True)
+    check("missing-DXF record links the part",
+          f["files"]["DXF"]["missing"][0]["partUrl"],
+          "https://cad.example/documents/D/v/V-PRT-101-A/e/P-PRT-101")
+
+    print("\nreport data: build / save / load / render")
+    data = build_report([res], "https://cad.example", ["DXF folder DXFDIR"])
+    check("format tag", data["format"], 1)
+    check("json-serialisable", isinstance(json.dumps(data), str), True)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = save_report(Path(tmp) / "r.json", data)
+        loaded = load_report(path)
+        check("round trip keeps results", loaded["results"][0]["partNumber"], "ASM-TEST")
+        check("round trip keeps generated stamp", loaded["generated"], data["generated"])
+        html = render_data(loaded)
+        check("rendered report names the assembly", '<h2 id="ASM-TEST">' in html, True)
+        check("rendered report shows the stored timestamp",
+              f"Generated {data['generated']}" in html, True)
+        check("rendered report links the assembly in Onshape",
+              'href="https://cad.example/documents/D/v/V/e/E?configuration=List_x%3DSTEEL"'
+              in html, True)
+        check("rendered report links a BOM line",
+              'href="https://cad.example/documents/D/v/V-PRT-100-B/e/E?configuration=default"'
+              in html, True)
+        check("rendered report links the lagging drawing",
+              'href="https://cad.example/documents/D/v/V-PRT-103-B/e/E-PRT-103"' in html,
+              True)
+        try:
+            (Path(tmp) / "junk.json").write_text("[1,2]", encoding="utf-8")
+            load_report(Path(tmp) / "junk.json")
+            check("non-report json rejected", False, True)
+        except ValueError:
+            check("non-report json rejected", True, True)
+    # a report saved before links existed still renders, just without arrows
+    bare = json.loads(json.dumps(res))
+    bare["assembly"].pop("url")
+    bare["assembly"].pop("drawingUrl")
+    for r in bare["rows"]:
+        r.pop("url")
+    for e in bare["findings"]["noDrawing"] + bare["findings"]["drawingBehindPart"]:
+        e.pop("partUrl")
+        e.pop("drawingUrl")
+    html_bare = render_data(build_report([bare], "https://cad.example"))
+    check("link-less data renders", '<h2 id="ASM-TEST">' in html_bare, True)
+    check("link-less data has no dangling anchors", 'href="None"' in html_bare, False)
+
+    print("\nexports skip files already in the folder")
+
+    class NoApiClient:
+        """Fails loudly if any export actually reaches Onshape."""
+        call_count = 0
+
+        def post(self, *a, **k):
+            raise OnshapeError("API was called")
+
+        def get(self, *a, **k):
+            raise OnshapeError("API was called")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        # pre-existing files at the current revisions
+        (out / "PRT-100_RevB.pdf").write_bytes(b"%PDF")
+        (out / "ASM-TEST_RevA_ASSEMBLY.pdf").write_bytes(b"%PDF")
+        (out / "PRT-102_RevB.pdf").write_bytes(b"")           # empty -> not trusted
+        entries = export_assembly_drawings(NoApiClient(), res, out, workers=2)
+        by_pn = {e["pn"]: e for e in entries}
+        check("existing part PDF skipped, no API call",
+              (by_pn["PRT-100"]["skipped"], by_pn["PRT-100"]["error"]), (True, None))
+        check("existing assembly PDF skipped", by_pn["ASM-TEST"]["skipped"], True)
+        check("skipped entry keeps its path", by_pn["PRT-100"]["path"],
+              str(out / "PRT-100_RevB.pdf"))
+        check("empty file is re-fetched (and here fails)",
+              bool(by_pn["PRT-102"]["error"]), True)
+        check("other drawings were attempted", bool(by_pn["PRT-103"]["error"]), True)
+        check("export_counts", export_counts(entries), (0, 2, 6))
+        forced = export_assembly_drawings(NoApiClient(), res, out, workers=2, force=True)
+        check("force re-fetches everything", export_counts(forced), (0, 0, 8))
+
+        (out / "ASM-TEST_RevA.step").write_bytes(b"ISO-10303")
+        step = export_assembly_step_file(NoApiClient(), res, out)
+        check("existing STEP skipped", (step["skipped"], step["error"]), (True, None))
+        step_forced = export_assembly_step_file(NoApiClient(), res, out, force=True)
+        check("forced STEP hits the API", bool(step_forced["error"]), True)
 
     print("\naudit_assembly with a drifted workspace")
     res2 = audit_assembly(MockClient(drift=True), "CID", "ASM-TEST", [], workers=4,

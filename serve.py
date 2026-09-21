@@ -35,9 +35,10 @@ from urllib.parse import parse_qs
 from audit_core import FileIndex, audit_assembly
 from onshape_client import DEFAULT_BASE_URL, OnshapeClient, OnshapeError
 from pdf_export import (export_assembly_drawings, export_assembly_step_file,
-                        safe_filename, zip_pdfs)
+                        export_counts, safe_filename, zip_pdfs)
 import config
-from revaudit import APP_NAME, CSS, credit_html, load_dotenv, render_report
+from revaudit import (APP_NAME, CSS, build_report, credit_html, load_dotenv,
+                      load_report, render_data, save_report)
 
 HERE = Path(__file__).resolve().parent
 config.ensure_from_example()          # so `launch.bat` alone still works
@@ -46,27 +47,42 @@ DEFAULT_SAT_DIR = config.folder("sat")
 DEFAULT_PDF_DIR = config.folder("pdf")
 DEFAULT_STEP_DIR = config.folder("step")
 
-# revaudit-<timestamp>-<random token>.html - the token is what makes a report
-# link safe to hand out without also handing out the site password: nobody can
-# guess it, so holding the link is proof enough that you were given it.
-SHARED_REPORT_RE = r"revaudit-\d{8}-\d{6}-[A-Za-z0-9_-]{10,}\.html"
+# A report is stored as revaudit-<timestamp>-<random token>.json - the audit
+# data only - and rendered to HTML whenever someone opens /report/<that id>.
+# The token is what makes a report link safe to hand out without also handing
+# out the site password: nobody can guess it, so holding the link is proof
+# enough that you were given it. The same id with .json appended returns the
+# raw data; with .html it serves a report saved before JSON storage existed
+# (those were written as finished HTML) or renders the JSON if there is none.
+SHARED_REPORT_RE = r"revaudit-\d{8}-\d{6}-[A-Za-z0-9_-]{10,}(?:\.json|\.html)?"
 
-# revaudit-<timestamp>.html with no token - reports made before link sharing
-# existed. They carry no secret of their own, so they still need the site
-# password rather than being reachable by anyone who finds the filename.
-LEGACY_REPORT_RE = r"revaudit-\d{8}-\d{6}\.html"
+# revaudit-<timestamp> with no token - reports the CLI writes into the shared
+# folder, and web reports from before link sharing existed. They carry no
+# secret of their own, so they still need the site password rather than
+# being reachable by anyone who finds the filename.
+LEGACY_REPORT_RE = r"revaudit-\d{8}-\d{6}(?:\.json|\.html)?"
+
+REPORT_EXTS = (".json", ".html")
 
 
-def new_report_name():
+def new_report_id():
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return f"revaudit-{stamp}-{secrets.token_urlsafe(12)}.html"
+    return f"revaudit-{stamp}-{secrets.token_urlsafe(12)}"
 
 
-def report_label(filename):
+def report_id(name):
+    """revaudit-...json / .html -> the bare report id used in /report/ links."""
+    for ext in REPORT_EXTS:
+        if name.endswith(ext):
+            return name[:-len(ext)]
+    return name
+
+
+def report_label(name):
     """Short label for the 'recent reports' list - just the timestamp, not
     the random token, which would be meaningless clutter to read."""
-    m = re.match(r"revaudit-(\d{8}-\d{6})-", filename)
-    return m.group(1) if m else filename
+    m = re.match(r"revaudit-(\d{8}-\d{6})", name)
+    return m.group(1) if m else name
 
 
 def report_dirs():
@@ -85,15 +101,13 @@ def report_dirs():
     return dirs
 
 
-def write_report(name, html_text):
-    """Save a report, preferring the configured folder, falling back to the
-    app folder if that can't be written. Returns the Path actually used."""
+def write_report(rid, data):
+    """Save a report's data as <rid>.json, preferring the configured folder,
+    falling back to the app folder if that can't be written. Returns the
+    Path actually used."""
     for target_dir in report_dirs():
         try:
-            target_dir.mkdir(parents=True, exist_ok=True)
-            path = target_dir / name
-            path.write_text(html_text, encoding="utf-8")
-            return path
+            return save_report(target_dir / f"{rid}.json", data)
         except OSError as exc:
             print(f"  report folder {target_dir} not writable ({exc}); trying next",
                   file=sys.stderr)
@@ -101,27 +115,34 @@ def write_report(name, html_text):
 
 
 def find_report(name):
-    """The report file for `name`, wherever it lives, or None."""
+    """The file behind `name` - a full revaudit-*.json / .html filename, or a
+    bare report id (its .json is preferred, then a legacy .html) - wherever
+    it lives, or None."""
+    names = [name] if name.endswith(REPORT_EXTS) else [name + e for e in REPORT_EXTS]
     for d in report_dirs():
-        candidate = d / name
-        try:
-            if candidate.is_file() and candidate.parent == d:
-                return candidate
-        except OSError:
-            continue
+        for candidate_name in names:
+            candidate = d / candidate_name
+            try:
+                if candidate.is_file() and candidate.parent == d:
+                    return candidate
+            except OSError:
+                continue
     return None
 
 
 def list_reports(limit=5):
-    """The most recent report files across every report folder, newest first."""
+    """The most recent reports across every report folder, newest first, one
+    entry per report id (a CLI run leaves a .json and an .html side by side)."""
     seen = {}
     for d in report_dirs():
-        try:
-            for p in d.glob("revaudit-*.html"):
-                if p.name not in seen or p.stat().st_mtime > seen[p.name].stat().st_mtime:
-                    seen[p.name] = p
-        except OSError:
-            continue
+        for ext in REPORT_EXTS:
+            try:
+                for p in d.glob(f"revaudit-*{ext}"):
+                    rid = report_id(p.name)
+                    if rid not in seen or p.stat().st_mtime > seen[rid].stat().st_mtime:
+                        seen[rid] = p
+            except OSError:
+                continue
     return sorted(seen.values(), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
 
 
@@ -335,6 +356,10 @@ def form_page(values=None, error=None, report_names=None):
     passed only their own, so one person's audit is never linked to another."""
     v = values or {}
     asm = html.escape(v.get("assemblies", ""))
+    # Exports default to on whenever their folder is configured - a re-run
+    # costs nothing for files already there - and follow the form on a resubmit.
+    export_drawings = v.get("export_drawings", bool(DEFAULT_PDF_DIR))
+    export_step = v.get("export_step", bool(DEFAULT_STEP_DIR))
 
     if report_names is None:
         reports = list_reports(5)
@@ -346,7 +371,8 @@ def form_page(values=None, error=None, report_names=None):
     recent = ""
     if reports:
         links = " ".join(
-            f"<a href='/report/{html.escape(p.name)}'>{html.escape(report_label(p.name))}</a>"
+            f"<a href='/report/{html.escape(report_id(p.name))}'>"
+            f"{html.escape(report_label(p.name))}</a>"
             for p in reports
         )
         recent = f"<div class='recent'><b>Recent reports</b><br>{links}</div>"
@@ -369,9 +395,10 @@ def form_page(values=None, error=None, report_names=None):
         <div class='row'>
           <input type='checkbox' name='export_drawings' id='export_drawings'
                  onchange="document.getElementById('pdf_dir').disabled = !this.checked"
-                 {"checked" if v.get("export_drawings") else ""}>
-          <label for='export_drawings'>Export a PDF of every drawing &mdash; adds
-            roughly 1 second per drawing, so off by default</label>
+                 {"checked" if export_drawings else ""}>
+          <label for='export_drawings'>Export a PDF of every drawing &mdash; only
+            drawings not already in the folder at their current revision are fetched
+            (about a second each)</label>
         </div>
         <label>PDF export folder
           <div class='hint'>Every released drawing (the assembly's own + every part's)
@@ -380,14 +407,14 @@ def form_page(values=None, error=None, report_names=None):
         </label>
         <input type='text' name='pdf_dir' id='pdf_dir'
                value='{html.escape(v.get("pdf_dir", DEFAULT_PDF_DIR))}'
-               {"" if v.get("export_drawings") else "disabled"}>
+               {"" if export_drawings else "disabled"}>
 
         <div class='row'>
           <input type='checkbox' name='export_step' id='export_step'
                  onchange="document.getElementById('step_dir').disabled = !this.checked"
-                 {"checked" if v.get("export_step") else ""}>
+                 {"checked" if export_step else ""}>
           <label for='export_step'>Export each assembly's 3D geometry as STEP &mdash;
-            off by default</label>
+            skipped when the file is already in the folder at this revision</label>
         </div>
         <label>STEP export folder
           <div class='hint'>One file per assembly (not per part), same flat/named
@@ -399,12 +426,18 @@ def form_page(values=None, error=None, report_names=None):
         </label>
         <input type='text' name='step_dir' id='step_dir'
                value='{html.escape(v.get("step_dir", DEFAULT_STEP_DIR))}'
-               {"" if v.get("export_step") else "disabled"}>
+               {"" if export_step else "disabled"}>
+
+        <div class='row'>
+          <input type='checkbox' name='force_export' id='force_export'
+                 {"checked" if v.get("force_export") else ""}>
+          <label for='force_export'>Re-fetch files that are already in the folders</label>
+        </div>
 
         <button type='submit' id='btn'>Run audit</button>
         <div class='spin' id='spin'>Running &mdash; the first run against any given
           folder indexes it, which takes about 15 seconds. Later runs reuse it.
-          Exporting drawings takes about a second each, on top of that.</div>
+          Each drawing not yet in the PDF folder takes about a second on top.</div>
       </form>
       {recent}
       <footer>{credit_html()}</footer>
@@ -430,19 +463,21 @@ SHARE_CSS = """
 """
 
 
-def with_back_link(report_html, saved_name, share_url=None):
+def with_back_link(report_html, saved_name, share_url=None, data_url=None):
     """share_url, if given, is shown as a copyable link - the report's filename
     carries enough random entropy that anyone with the link can open it without
     the site password, so it is safe to hand to someone who only needs to see
-    this one result."""
+    this one result. data_url links the raw JSON the page was rendered from."""
     link_row = ""
     if share_url:
+        data_link = (f"<a class='back' href='{html.escape(data_url)}'>data (.json)</a>"
+                     if data_url else "")
         link_row = (
             f"<div class='share'><input readonly id='shareUrl' "
             f"value='{html.escape(share_url)}' onclick='this.select()'>"
             f"<button type='button' onclick='copyShareUrl()'>Copy link</button>"
             f"<span id='copied' style='color:var(--ok);font-size:12.5px;display:none'>"
-            f"copied</span></div>"
+            f"copied</span>{data_link}</div>"
             # navigator.clipboard is undefined on a plain-http LAN address
             # (not a secure context), so fall back to execCommand there
             "<script>function copyShareUrl(){"
@@ -513,13 +548,12 @@ class Handler(BaseHTTPRequestHandler):
         # it falls through to the normal password gate below instead.
         if self.path.startswith("/report/"):
             name = self.path[len("/report/"):]
-            target = find_report(name)      # searches the report folder + app folder
-            if target and re.fullmatch(SHARED_REPORT_RE, name):
-                return self._send(target.read_bytes())
-            if target and re.fullmatch(LEGACY_REPORT_RE, name):
+            if re.fullmatch(SHARED_REPORT_RE, name):
+                return self._serve_report(name)
+            if re.fullmatch(LEGACY_REPORT_RE, name):
                 if not self._authorized():
                     return self._challenge()
-                return self._send(target.read_bytes())
+                return self._serve_report(name)
             return self._send(page("Not found", "<h1>Report not found</h1>"), 404)
 
         if self.path.startswith("/download/"):
@@ -541,6 +575,38 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(b"", 204, "image/x-icon")
         return self._send(page("Not found", "<h1>Not found</h1>"), 404)
 
+    def _serve_report(self, name):
+        """/report/<id> renders the stored JSON; /report/<id>.json returns it
+        raw; /report/<id>.html serves a pre-JSON report saved as HTML, or
+        renders the JSON when only that exists."""
+        target = find_report(name)      # searches the report folder + app folder
+        if target is None and name.endswith(".html"):
+            target = find_report(report_id(name))     # .html asked, only .json kept
+        if target is None:
+            return self._send(page("Not found", "<h1>Report not found</h1>"), 404)
+        if target.suffix == ".json":
+            if name.endswith(".json"):
+                return self._send(target.read_bytes(), 200, "application/json; charset=utf-8")
+            try:
+                data = load_report(target)
+            except (OSError, ValueError) as exc:
+                return self._send(page("Error", f"<h1>Unreadable report</h1>"
+                                       f"<div class='err'>{html.escape(str(exc))}</div>"), 500)
+            rid = report_id(target.name)
+            body = with_back_link(render_data(data), str(target),
+                                  *self._share_urls(rid))
+            return self._send(body.encode("utf-8"))
+        return self._send(target.read_bytes())
+
+    def _share_urls(self, rid):
+        """(page url, data url) for a report id, built from the Host header the
+        request arrived on so the link is right at localhost and the LAN IP
+        alike. A legacy id (no token) is password-gated, so no share link."""
+        if not re.fullmatch(SHARED_REPORT_RE, rid):
+            return None, None
+        host = self.headers.get("Host", f"localhost:{self.server.server_port}")
+        return f"http://{host}/report/{rid}", f"http://{host}/report/{rid}.json"
+
     def do_POST(self):
         if self.path == "/dxf-index":
             return handle_index_upload(self)     # token-authenticated, not a user
@@ -550,22 +616,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(page("Not found", "<h1>Not found</h1>"), 404)
 
         length = int(self.headers.get("Content-Length") or 0)
-        fields = parse_qs(self.rfile.read(length).decode("utf-8"))
-        values = {
-            "assemblies": (fields.get("assemblies", [""])[0]).strip(),
-            "export_drawings": bool(fields.get("export_drawings")),
-            "pdf_dir": (fields.get("pdf_dir", [""])[0]).strip(),
-            "export_step": bool(fields.get("export_step")),
-            "step_dir": (fields.get("step_dir", [""])[0]).strip(),
-        }
-        for check in FILE_CHECK_DEFS:
-            field = check["field"]
-            values[f"{field}_dir"] = (fields.get(f"{field}_dir", [""])[0]).strip()
-            values[f"{field}_recursive"] = bool(fields.get(f"{field}_recursive"))
-            values[f"{field}_material_regex"] = (
-                fields.get(f"{field}_material_regex", [check["default_regex"]])[0]
-            ).strip()
-
+        values = parse_run_form(parse_qs(self.rfile.read(length).decode("utf-8")))
         names = [n for n in re.split(r"[\s,]+", values["assemblies"]) if n]
         if not names:
             return self._send(form_page(values, "Enter at least one assembly number."))
@@ -578,27 +629,56 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with _run_lock:          # one audit at a time keeps API load predictable
                 results = run_audit(names, values)
-                if values["export_drawings"] and values["pdf_dir"]:
-                    export_drawings_for(results, SERVER_STATE["client"], host,
-                                        values["pdf_dir"])
-                if values["export_step"] and values["step_dir"]:
-                    export_step_for(results, SERVER_STATE["client"], host,
-                                    values["step_dir"])
+                run_exports(results, SERVER_STATE["client"], host, values)
         except OnshapeError as exc:
             return self._send(form_page(values, str(exc)))
         except Exception as exc:                      # noqa: BLE001
             traceback.print_exc()
             return self._send(form_page(values, f"{type(exc).__name__}: {exc}"))
 
-        folder_notes = [
-            f"{check['name']} folder {values[check['field'] + '_dir']}"
-            for check in FILE_CHECK_DEFS if values[check["field"] + "_dir"]
-        ]
-        report = render_report(results, self.server.base_url, folder_notes)
-        name = new_report_name()
-        saved = write_report(name, report)          # configured folder, or app folder
-        share_url = f"http://{host}/report/{name}"
-        self._send(with_back_link(report, str(saved), share_url).encode("utf-8"))
+        data = build_report(results, self.server.base_url, folder_notes_for(values))
+        rid = new_report_id()
+        saved = write_report(rid, data)             # configured folder, or app folder
+        body = with_back_link(render_data(data), str(saved), *self._share_urls(rid))
+        self._send(body.encode("utf-8"))
+
+
+def parse_run_form(fields):
+    """The /run form's fields (from parse_qs) as the values dict the audit,
+    export and re-rendered form all read."""
+    values = {
+        "assemblies": (fields.get("assemblies", [""])[0]).strip(),
+        "export_drawings": bool(fields.get("export_drawings")),
+        "pdf_dir": (fields.get("pdf_dir", [""])[0]).strip(),
+        "export_step": bool(fields.get("export_step")),
+        "step_dir": (fields.get("step_dir", [""])[0]).strip(),
+        "force_export": bool(fields.get("force_export")),
+    }
+    for check in FILE_CHECK_DEFS:
+        field = check["field"]
+        values[f"{field}_dir"] = (fields.get(f"{field}_dir", [""])[0]).strip()
+        values[f"{field}_recursive"] = bool(fields.get(f"{field}_recursive"))
+        values[f"{field}_material_regex"] = (
+            fields.get(f"{field}_material_regex", [check["default_regex"]])[0]
+        ).strip()
+    return values
+
+
+def folder_notes_for(values):
+    """The "DXF folder <path>" subtitle notes for the checks that ran."""
+    return [
+        f"{check['name']} folder {values[check['field'] + '_dir']}"
+        for check in FILE_CHECK_DEFS if values.get(check["field"] + "_dir")
+    ]
+
+
+def run_exports(results, client, host, values):
+    """The PDF and STEP exports the form asked for, attached to results."""
+    force = bool(values.get("force_export"))
+    if values.get("export_drawings") and values.get("pdf_dir"):
+        export_drawings_for(results, client, host, values["pdf_dir"], force=force)
+    if values.get("export_step") and values.get("step_dir"):
+        export_step_for(results, client, host, values["step_dir"], force=force)
 
 
 def build_file_checks(values):
@@ -639,7 +719,7 @@ def run_audit(names, values):
     return results
 
 
-def export_drawings_for(results, client, host, pdf_dir):
+def export_drawings_for(results, client, host, pdf_dir, force=False):
     """Export + zip drawings for every audited assembly that resolved, and
     attach a shareable download link to each result in place. One PDF export
     round trip per drawing, so this is the slow part of a run - callers show
@@ -659,18 +739,20 @@ def export_drawings_for(results, client, host, pdf_dir):
             continue
         asm_pn = result["partNumber"]
         print(f"  exporting drawings for {asm_pn} to {pdf_dir} ...", file=sys.stderr)
-        entries = export_assembly_drawings(client, result, pdf_dir, workers=6)
+        entries = export_assembly_drawings(client, result, pdf_dir, workers=6,
+                                           force=force)
         zip_name = new_zip_name(asm_pn)
         zip_path = zip_pdfs(entries, DRAWINGS_DIR / zip_name)
-        failed = len([e for e in entries if e.get("error")])
-        print(f"    {len(entries) - failed} exported, {failed} failed", file=sys.stderr)
+        ok, skipped, failed = export_counts(entries)
+        print(f"    {ok} exported, {skipped} already there, {failed} failed",
+              file=sys.stderr)
         result["drawingExport"] = {
             "entries": entries,
             "zipUrl": f"http://{host}/download/{zip_name}" if zip_path else None,
         }
 
 
-def export_step_for(results, client, host, step_dir):
+def export_step_for(results, client, host, step_dir, force=False):
     """Export one STEP file per audited assembly that resolved, and attach a
     shareable download link to each result in place.
 
@@ -687,12 +769,13 @@ def export_step_for(results, client, host, step_dir):
             continue
         asm_pn = result["partNumber"]
         print(f"  exporting STEP for {asm_pn} to {step_dir} ...", file=sys.stderr)
-        entry = export_assembly_step_file(client, result, step_dir)
+        entry = export_assembly_step_file(client, result, step_dir, force=force)
         if entry and not entry.get("error"):
             step_name = new_step_name(asm_pn)
             shutil.copyfile(entry["path"], DRAWINGS_DIR / step_name)
             entry["url"] = f"http://{host}/download/{step_name}"
-            print("    exported", file=sys.stderr)
+            print("    already there" if entry.get("skipped") else "    exported",
+                  file=sys.stderr)
         elif entry:
             print(f"    failed: {entry['error']}", file=sys.stderr)
         result["stepExport"] = entry

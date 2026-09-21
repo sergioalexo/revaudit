@@ -19,6 +19,7 @@ from onshape_client import (
     drawing_ids,
     normalize_bom,
     rev_lt,
+    view_url,
 )
 
 
@@ -120,6 +121,9 @@ def resolve_assembly(client, company_id, part_number):
         "hasCurrentDrawing": drawing_current is not None,
         # kept so a drawing can be PDF-exported later without re-querying
         "drawingIds": drawing_ids(drawing_current),
+        # Onshape links that open the released version + configuration
+        "url": view_url(chosen),
+        "drawingUrl": view_url(drawing_current),
     }
 
 
@@ -139,6 +143,9 @@ def part_status(client, company_id, part_number):
         "sourceDoc": part_cur.get("documentName") if part_cur else None,
         # kept so a drawing can be PDF-exported later without re-querying
         "drawingIds": drawing_ids(drawing_cur),
+        # Onshape links to the current part revision and drawing revision
+        "partUrl": view_url(part_cur),
+        "drawingUrl": view_url(drawing_cur),
     }
 
 
@@ -232,7 +239,8 @@ def audit_assembly(client, company_id, asm_pn, file_checks=None,
             "pn": pn,
             "mixedRevisions": len(revs) > 1,
             "lines": [
-                {"item": l["item"], "rev": l["rev"], "state": l["state"], "qty": l["qty"]}
+                {"item": l["item"], "rev": l["rev"], "state": l["state"], "qty": l["qty"],
+                 "url": l.get("url")}
                 for l in lines
             ],
         })
@@ -248,12 +256,13 @@ def audit_assembly(client, company_id, asm_pn, file_checks=None,
         {
             "item": r["item"], "pn": r["pn"], "rev": r["rev"], "qty": r["qty"],
             "name": r["name"], "supersededInBom": r["pn"] in superseded,
+            "url": r.get("url"),
         }
         for r in rows if r["state"] == "OBSOLETE"
     ]
     result["findings"]["notRevisionManaged"] = [
         {"item": r["item"], "pn": r["pn"], "qty": r["qty"], "state": r["state"],
-         "name": r["name"], "material": r["material"]}
+         "name": r["name"], "material": r["material"], "url": r.get("url")}
         for r in rows
         if r["state"] and r["state"] not in ("RELEASED", "OBSOLETE")
     ]
@@ -302,6 +311,8 @@ def audit_assembly(client, company_id, asm_pn, file_checks=None,
             "partRev": st["partRev"],
             "drawingRev": st["drawingRev"],
             "sourceDoc": st["sourceDoc"],
+            "partUrl": st.get("partUrl"),
+            "drawingUrl": st.get("drawingUrl"),
         }
         if not st["drawingRev"]:
             if deep:
@@ -336,6 +347,7 @@ def audit_assembly(client, company_id, asm_pn, file_checks=None,
                 "material": material,
                 "qty": qty_by_pn.get(pn),
                 "files": hits,
+                "partUrl": (statuses.get(pn) or {}).get("partUrl"),
             }
             if expected and not hits:
                 missing.append(record)
@@ -365,7 +377,5 @@ def audit_assembly(client, company_id, asm_pn, file_checks=None,
         }
     if files_result:
         result["findings"]["files"] = files_result
-        if "DXF" in files_result:                          # back-compat
-            result["findings"]["dxf"] = files_result["DXF"]
 
     return result

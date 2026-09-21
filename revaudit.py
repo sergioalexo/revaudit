@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import os
 import re
 import sys
@@ -32,13 +33,20 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 
+import config
 from audit_core import FileIndex, audit_assembly
 from onshape_client import DEFAULT_BASE_URL, OnshapeClient, OnshapeError
-from pdf_export import export_assembly_drawings, export_assembly_step_file, zip_pdfs
+from pdf_export import (export_assembly_drawings, export_assembly_step_file,
+                        export_counts, zip_pdfs)
 
 APP_NAME = "RevAudit"
 AUTHOR = "Sergio Alexo"
 AUTHOR_URL = "https://sergioalexo.com"
+
+# Bumped whenever the saved report data changes shape in a way the renderer
+# has to know about. Older files are still rendered - every lookup is a
+# .get() - this just names the layout.
+REPORT_FORMAT = 1
 
 
 def credit_html(prefix=""):
@@ -125,6 +133,11 @@ code{cursor:pointer;border-radius:3px;padding:0 2px;transition:background .12s}
 code:hover{background:var(--panel2)}
 code.copied{background:var(--ok-bg);color:var(--ok)}
 code.copied::after{content:" copied";font-size:11px}
+a.os{color:var(--accent);text-decoration:none;font-size:12px;margin-left:4px;
+  opacity:.65;vertical-align:baseline}
+a.os:hover{opacity:1;text-decoration:underline}
+.meta a{color:var(--accent);text-decoration:none}
+.meta a:hover{text-decoration:underline}
 .tag{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11.5px;
   font-weight:700;letter-spacing:.03em}
 .tag.RELEASED{background:var(--ok-bg);color:var(--ok)}
@@ -169,6 +182,27 @@ def state_tag(state):
     return f'<span class="tag {cls}">{esc(state or "-")}</span>'
 
 
+def os_link(url, title="Open in Onshape", text="&#8599;"):
+    """A small arrow that opens url in a new tab - the Onshape document at
+    the exact version and configuration the audit looked at. Empty when the
+    record carried no link (older saved reports, mock data)."""
+    if not url:
+        return ""
+    return (f'<a class="os" href="{esc(url)}" target="_blank" rel="noopener noreferrer" '
+            f'title="{esc(title)}">{text}</a>')
+
+
+def pn_cell(pn, url=None, title="Open the part in Onshape", extra_class=""):
+    """Part number as a click-to-copy token, followed by its Onshape link."""
+    cls = f' class="{extra_class}"' if extra_class else ""
+    return f"<code{cls}>{esc(pn)}</code>{os_link(url, title)}"
+
+
+def rev_cell(rev, url=None, title="Open this revision in Onshape", bold=False):
+    text = f"<b>{esc(rev)}</b>" if bold else esc(rev)
+    return f"{text}{os_link(url, title)}"
+
+
 def table(headers, rows, aligns=None):
     if not rows:
         return ""
@@ -211,9 +245,11 @@ def render_assembly(result):
     out.append(
         '<div class="meta">'
         f'<span>Document <b>{esc(asm["documentName"])}</b></span>'
-        f'<span>Assembly rev <b>{esc(asm["revision"])}</b></span>'
+        f'<span>Assembly rev <b>{esc(asm["revision"])}</b>'
+        f'{os_link(asm.get("url"), "Open the released assembly in Onshape")}</span>'
         f'<span>Released <b>{esc(asm["releaseDate"] or "-")}</b></span>'
-        f'<span>Assembly drawing <b>{esc(dwg or "none")}</b></span>'
+        f'<span>Assembly drawing <b>{esc(dwg or "none")}</b>'
+        f'{os_link(asm.get("drawingUrl"), "Open the assembly drawing in Onshape")}</span>'
         f'<span>Source <b>{esc(result.get("bomSource", ""))}</b></span>'
         + (f'<span>Configuration <b>{esc(pretty_configuration(asm["configuration"]))}</b></span>'
            if asm.get("configuration") else "")
@@ -256,8 +292,8 @@ def render_assembly(result):
     body = table(
         ["Part", "Name", "Material", "Qty", "Part rev", "Source document"],
         [
-            [f'<code>{esc(e["pn"])}</code>', esc(e["name"]), esc(e["material"]),
-             esc(e["qty"]), esc(e["partRev"]), esc(e["sourceDoc"])]
+            [pn_cell(e["pn"], e.get("partUrl")), esc(e["name"]), esc(e["material"]),
+             esc(e["qty"]), rev_cell(e["partRev"], e.get("partUrl")), esc(e["sourceDoc"])]
             for e in no_drawing
         ],
         ["", "", "", "num", "", ""],
@@ -270,8 +306,11 @@ def render_assembly(result):
     body = table(
         ["Part", "Name", "Part rev", "Newest drawing rev", "Qty"],
         [
-            [f'<code>{esc(e["pn"])}</code>', esc(e["name"]), esc(e["partRev"]),
-             f'<b>{esc(e["drawingRev"])}</b>', esc(e["qty"])]
+            [pn_cell(e["pn"], e.get("partUrl")), esc(e["name"]),
+             rev_cell(e["partRev"], e.get("partUrl"), "Open the part revision in Onshape"),
+             rev_cell(e["drawingRev"], e.get("drawingUrl"),
+                      "Open the drawing revision in Onshape", bold=True),
+             esc(e["qty"])]
             for e in behind
         ],
         ["", "", "", "", "num"],
@@ -284,12 +323,14 @@ def render_assembly(result):
     dup_rows = []
     for d in dups:
         detail = " &nbsp;/&nbsp; ".join(
-            f'item {esc(l["item"])}: rev <b>{esc(l["rev"])}</b> &times;{esc(l["qty"])} '
-            f'{state_tag(l["state"])}'
+            f'item {esc(l["item"])}: rev <b>{esc(l["rev"])}</b>'
+            f'{os_link(l.get("url"), "Open this BOM line in Onshape")} '
+            f'&times;{esc(l["qty"])} {state_tag(l["state"])}'
             for l in d["lines"]
         )
         total = sum((l["qty"] or 0) for l in d["lines"])
-        dup_rows.append([f'<code>{esc(d["pn"])}</code>', detail, esc(total)])
+        first_url = next((l.get("url") for l in d["lines"] if l.get("url")), None)
+        dup_rows.append([pn_cell(d["pn"], first_url, "Open in Onshape"), detail, esc(total)])
     out.append(section(
         "Same part number at two or more revisions",
         table(["Part", "Lines", "Total qty"], dup_rows, ["", "", "num"]),
@@ -302,8 +343,8 @@ def render_assembly(result):
     body = table(
         ["Item", "Part", "Name", "Rev", "Qty", "Superseded in this BOM?"],
         [
-            [esc(o["item"]), f'<code>{esc(o["pn"])}</code>', esc(o["name"]),
-             esc(o["rev"]), esc(o["qty"]),
+            [esc(o["item"]), pn_cell(o["pn"], o.get("url"), "Open this BOM line in Onshape"),
+             esc(o["name"]), esc(o["rev"]), esc(o["qty"]),
              "yes" if o["supersededInBom"] else "<b>no</b>"]
             for o in obs
         ],
@@ -317,8 +358,10 @@ def render_assembly(result):
     body = table(
         ["Part", "Name", "Rev in BOM", "Current part rev", "Qty"],
         [
-            [f'<code>{esc(e["pn"])}</code>', esc(e["name"]),
-             esc(", ".join(e.get("bomRevs") or [])), f'<b>{esc(e["partRev"])}</b>',
+            [pn_cell(e["pn"], e.get("partUrl")), esc(e["name"]),
+             esc(", ".join(e.get("bomRevs") or [])),
+             rev_cell(e["partRev"], e.get("partUrl"), "Open the current part revision",
+                      bold=True),
              esc(e["qty"])]
             for e in stale
         ],
@@ -332,8 +375,8 @@ def render_assembly(result):
     body = table(
         ["Item", "Part", "Name", "State", "Qty"],
         [
-            [esc(u["item"]), f'<code>{esc(u["pn"])}</code>', esc(u["name"]),
-             state_tag(u["state"]), esc(u["qty"])]
+            [esc(u["item"]), pn_cell(u["pn"], u.get("url"), "Open this BOM line in Onshape"),
+             esc(u["name"]), state_tag(u["state"]), esc(u["qty"])]
             for u in unmanaged
         ],
         ["num", "", "", "", "num"],
@@ -383,7 +426,7 @@ def render_assembly(result):
             out.append(table(
                 ["Part", "Name", "Material", "Qty"],
                 [
-                    [f'<code class="miss">{esc(m["pn"])}</code>',
+                    [pn_cell(m["pn"], m.get("partUrl"), extra_class="miss"),
                      f'<span class="miss">{esc(m["name"])}</span>',
                      esc(m["material"]), esc(m["qty"])]
                     for m in fc["missing"]
@@ -394,7 +437,7 @@ def render_assembly(result):
             out.append(f'<p class="good">Every part expecting {esc(check_name)} has one.</p>')
         if fc.get("multiple"):
             rows_m = [
-                [f'<code>{esc(m["pn"])}</code>', esc(m["name"]),
+                [pn_cell(m["pn"], m.get("partUrl")), esc(m["name"]),
                  f'<b>{len(m["files"])}</b>',
                  " &nbsp;".join(f"<code>{esc(fn)}</code>" for fn in m["files"])]
                 for m in fc["multiple"]
@@ -408,7 +451,7 @@ def render_assembly(result):
             )
         if fc["unexpected"]:
             rows_u = [
-                [f'<code>{esc(u["pn"])}</code>', esc(u["material"]),
+                [pn_cell(u["pn"], u.get("partUrl")), esc(u["material"]),
                  esc(", ".join(u["files"][:4]))]
                 for u in fc["unexpected"]
             ]
@@ -422,15 +465,20 @@ def render_assembly(result):
     export = result.get("drawingExport")
     if export:
         entries = export.get("entries", [])
-        ok = [e for e in entries if not e.get("error")]
+        exported, skipped, n_failed = export_counts(entries)
         failed = [e for e in entries if e.get("error")]
         out.append("<h3>Drawing PDF export</h3>")
-        if ok:
+        if exported or skipped:
             cls = "bad" if failed else "ok"
-            plural = "s" if len(ok) != 1 else ""
-            tail = f", {len(failed)} failed" if failed else ""
-            out.append(f'<div class="verdict {cls}">{len(ok)} drawing PDF{plural} '
-                       f"exported{tail}.</div>")
+            bits = []
+            if exported:
+                bits.append(f"{exported} drawing PDF{'s' if exported != 1 else ''} exported")
+            if skipped:
+                bits.append(f"{skipped} already in the folder at the current revision "
+                            "(not fetched again)")
+            if failed:
+                bits.append(f"{n_failed} failed")
+            out.append(f'<div class="verdict {cls}">{", ".join(bits)}.</div>')
         elif failed:
             out.append(f'<div class="verdict bad">All {len(failed)} drawing exports '
                        "failed.</div>")
@@ -455,6 +503,9 @@ def render_assembly(result):
         out.append("<h3>STEP export</h3>")
         if step.get("error"):
             out.append(f'<div class="verdict bad">Export failed: {esc(step["error"])}</div>')
+        elif step.get("skipped"):
+            out.append('<div class="verdict ok">Already in the folder at this revision '
+                       "&mdash; not fetched again.</div>")
         else:
             out.append('<div class="verdict ok">Exported.</div>')
             if step.get("url"):
@@ -473,8 +524,9 @@ def render_assembly(result):
 
     # full BOM
     bom_rows = [
-        [esc(r["item"]), f'<code>{esc(r["pn"])}</code>', esc(r["name"]),
-         esc(r["rev"]), state_tag(r["state"]), esc(r["qty"]), esc(r["material"])]
+        [esc(r["item"]), pn_cell(r["pn"], r.get("url"), "Open this BOM line in Onshape"),
+         esc(r["name"]), esc(r["rev"]), state_tag(r["state"]), esc(r["qty"]),
+         esc(r["material"])]
         for r in rows
     ]
     out.append(
@@ -486,15 +538,56 @@ def render_assembly(result):
     return "".join(out)
 
 
-def render_report(results, base_url, folder_notes=None):
-    """folder_notes: list of "Label path" strings shown in the subtitle, e.g.
+def build_report(results, base_url, folder_notes=None, generated=None):
+    """Everything a report needs, as one JSON-serialisable dict. This is what
+    gets saved to disk; the HTML is rendered from it on demand, so the stored
+    record stays small and a later version of the renderer can re-render an
+    old audit with whatever the report looks like by then.
+
+    folder_notes: list of "Label path" strings shown in the subtitle, e.g.
     ["DXF folder K:\\...\\DXF FILES", "SAT folder K:\\...\\SAT FILES"]. A bare
     string is accepted too, for callers that only ever had one folder."""
     if isinstance(folder_notes, str):
         folder_notes = [folder_notes] if folder_notes else []
-    folder_notes = folder_notes or []
+    return {
+        "app": APP_NAME,
+        "format": REPORT_FORMAT,
+        "generated": generated or datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "baseUrl": base_url,
+        "folderNotes": list(folder_notes or []),
+        "results": results,
+    }
 
-    generated = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+def save_report(path, data):
+    """Write report data as compact JSON. Returns the Path."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, separators=(",", ":"), ensure_ascii=False),
+                    encoding="utf-8")
+    return path
+
+
+def load_report(path):
+    """Read report data saved by save_report. Raises ValueError if the file
+    is not a RevAudit report."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or "results" not in data:
+        raise ValueError(f"{path} is not a {APP_NAME} report")
+    return data
+
+
+def render_report(results, base_url, folder_notes=None, generated=None):
+    """Render straight from audit results - build_report + render_data."""
+    return render_data(build_report(results, base_url, folder_notes, generated))
+
+
+def render_data(data):
+    """The HTML report for a dict from build_report / load_report."""
+    results = data.get("results") or []
+    base_url = data.get("baseUrl") or ""
+    folder_notes = data.get("folderNotes") or []
+    generated = data.get("generated") or ""
     parts = [
         "<!doctype html><html><head><meta charset='utf-8'>",
         "<meta name='viewport' content='width=device-width,initial-scale=1'>",
@@ -519,14 +612,15 @@ def render_report(results, base_url, folder_notes=None):
             asm = r.get("assembly")
             if not asm:
                 summary.append(
-                    [f'<code>{esc(r["partNumber"])}</code>', "<b>not found</b>", "", "", ""]
+                    [pn_cell(r["partNumber"]), "<b>not found</b>", "", "", ""]
                     + ["" for _ in check_names])
                 continue
             nd = len(f.get("noDrawing", []))
             beh = len(f.get("drawingBehindPart", []))
             dup = len([d for d in f.get("duplicatePartNumbers", []) if d["mixedRevisions"]])
             row = [
-                f'<a href="#{esc(r["partNumber"])}"><code>{esc(r["partNumber"])}</code></a>',
+                f'<a href="#{esc(r["partNumber"])}"><code>{esc(r["partNumber"])}</code></a>'
+                f'{os_link(asm.get("url"), "Open the released assembly in Onshape")}',
                 esc(asm["revision"]),
                 f"<b>{nd}</b>" if nd else "0",
                 f"<b>{beh}</b>" if beh else "0",
@@ -553,7 +647,8 @@ def render_report(results, base_url, folder_notes=None):
         "release completes. Part revisions and drawing revisions are queried separately, "
         "which is what surfaces a drawing that lags its part. File matching (DXF, SAT) is "
         "case-insensitive with digit boundaries, so PRT-12 never matches PRT-123. "
-        "Click any part number or filename to copy it."
+        "Click any part number or filename to copy it; the &#8599; beside it opens that "
+        "exact revision and configuration in Onshape."
         "<p style='margin-top:14px'>" + credit_html(f"{APP_NAME} &middot; ") + "</p>"
         "</footer>" + COPY_SCRIPT + "</div></body></html>"
     )
@@ -625,15 +720,15 @@ def print_summary(result):
             print(f"    {(name + ' extras').ljust(20, '.')} {multi}  <-- review")
     export = result.get("drawingExport")
     if export:
-        entries = export.get("entries", [])
-        failed = len([e for e in entries if e.get("error")])
-        ok = len(entries) - failed
+        ok, skipped, failed = export_counts(export.get("entries", []))
         print(f"    drawing PDFs ........ {ok} exported"
+             + (f", {skipped} already there" if skipped else "")
              + (f", {failed} failed  <-- check" if failed else ""))
     step = result.get("stepExport")
     if step:
         print("    STEP export ......... "
-             + ("failed  <-- check: " + step["error"] if step.get("error") else "ok"))
+             + ("failed  <-- check: " + step["error"] if step.get("error")
+                else "already there" if step.get("skipped") else "ok"))
     for err in result.get("errors", []):
         print(f"    ! {err}")
 
@@ -643,6 +738,9 @@ def print_summary(result):
 # --------------------------------------------------------------------------
 
 def main(argv=None):
+    here = Path(__file__).resolve().parent
+    load_dotenv(here / ".env")     # before the parser: export defaults read env vars
+
     parser = argparse.ArgumentParser(
         prog="revaudit",
         description="Release / drawing / production-file audit for Onshape assemblies.",
@@ -653,10 +751,14 @@ def main(argv=None):
             '  py -3.13 revaudit.py ASM-12345 --dxf-dir "<share>\\DXF FILES" '
             '--sat-dir "<share>\\SAT FILES" --open\n'
             "  py -3.13 revaudit.py ASM-1 ASM-2 ASM-3 -o audit.html\n"
+            "  py -3.13 revaudit.py --render reports/revaudit-20260921-1405.json --open\n"
         ),
     )
-    parser.add_argument("assemblies", nargs="+", metavar="ASM",
+    parser.add_argument("assemblies", nargs="*", metavar="ASM",
                         help="assembly part numbers, e.g. ASM-12345")
+    parser.add_argument("--render", metavar="FILE.json",
+                        help="re-render the HTML report from a saved report's JSON "
+                             "data instead of running an audit - no Onshape calls")
     parser.add_argument("--dxf-dir", metavar="PATH",
                         help="folder to check for DXF files (omit to skip the DXF check)")
     parser.add_argument("--dxf-recursive", action="store_true",
@@ -673,31 +775,42 @@ def main(argv=None):
                         help="comma-separated SAT extensions (default: .sat)")
     parser.add_argument("--sat-material-regex", default=r"TUBE",
                         help="materials that require a SAT file (default: 'TUBE')")
-    parser.add_argument("--export-drawings", nargs="?",
-                        const=os.environ.get("REVAUDIT_PDF_DIR", "drawings"),
-                        metavar="DIR", default=None,
+    # Exports are on whenever a folder is configured (revaudit.conf [folders]
+    # pdf / step, or REVAUDIT_PDF_DIR / REVAUDIT_STEP_DIR). Files already in
+    # the folder at the current revision are never fetched again, so leaving
+    # them on costs nothing once an assembly has been exported once.
+    parser.add_argument("--export-drawings", nargs="?", const="", metavar="DIR",
+                        default=config.folder("pdf") or None,
                         help="export a PDF of every released drawing (the assembly's "
                              "own + every part's) into DIR, flat and named "
                              "<part>_Rev<rev>.pdf, plus a zip of the same files for "
-                             "this run. Default DIR if given with no value: "
-                             "REVAUDIT_PDF_DIR, or a 'drawings' subfolder. One Onshape "
-                             "API round trip per drawing, so a large assembly takes a "
-                             "while.")
+                             "this run. On by default when a pdf folder is configured; "
+                             "DIR overrides it. Drawings whose PDF is already in the "
+                             "folder at the current revision are skipped.")
+    parser.add_argument("--no-export-drawings", action="store_true",
+                        help="skip the drawing PDF export even if a folder is configured")
     parser.add_argument("--drawing-workers", type=int, default=4,
                         help="parallel PDF exports (default: 4)")
-    parser.add_argument("--export-step", nargs="?",
-                        const=os.environ.get("REVAUDIT_STEP_DIR", "step"),
-                        metavar="DIR", default=None,
+    parser.add_argument("--export-step", nargs="?", const="", metavar="DIR",
+                        default=config.folder("step") or None,
                         help="export each assembly's own 3D geometry to a single STEP "
-                             "file into DIR, flat and named <asm>_Rev<rev>.step. "
-                             "Default DIR if given with no value: REVAUDIT_STEP_DIR, "
-                             "or a 'step' subfolder. Component names inside the file "
-                             "use Onshape's part NAME unless an Export Rule mapping to "
-                             "Part Number is configured in Company Settings -> "
-                             "Preferences -> Export Rules - this tool cannot set that "
-                             "up for you.")
+                             "file into DIR, flat and named <asm>_Rev<rev>.step. On by "
+                             "default when a step folder is configured; DIR overrides "
+                             "it. Skipped when the file is already there at the current "
+                             "revision. Component names inside the file use Onshape's "
+                             "part NAME unless an Export Rule mapping to Part Number is "
+                             "configured in Company Settings -> Preferences -> Export "
+                             "Rules - this tool cannot set that up for you.")
+    parser.add_argument("--no-export-step", action="store_true",
+                        help="skip the STEP export even if a folder is configured")
+    parser.add_argument("--force-export", action="store_true",
+                        help="re-fetch PDFs/STEP files even when they are already in "
+                             "the folder")
     parser.add_argument("-o", "--output", metavar="FILE",
-                        help="HTML report path (default: revaudit-<timestamp>.html)")
+                        help="report path; the audit data is saved as FILE's .json "
+                             "twin and the HTML rendered next to it (default: "
+                             "revaudit-<timestamp>.json + .html in the configured "
+                             "report folder)")
     parser.add_argument("--open", action="store_true", dest="open_report",
                         help="open the report in the browser when done")
     parser.add_argument("--base-url", help="Onshape base URL (or ONSHAPE_BASE_URL)")
@@ -709,8 +822,32 @@ def main(argv=None):
     parser.add_argument("-v", "--verbose", action="store_true", help="log every API call")
     args = parser.parse_args(argv)
 
-    here = Path(__file__).resolve().parent
-    load_dotenv(here / ".env")
+    if args.render:
+        # Offline path: stored data -> HTML, no credentials needed.
+        try:
+            data = load_report(args.render)
+        except (OSError, ValueError) as exc:
+            print(f"Cannot render {args.render}: {exc}", file=sys.stderr)
+            return 2
+        out_path = Path(args.output) if args.output else Path(args.render).with_suffix(".html")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(render_data(data), encoding="utf-8")
+        print(f"Report written to {out_path}")
+        if args.open_report:
+            webbrowser.open(out_path.resolve().as_uri())
+        return 0
+    if not args.assemblies:
+        parser.error("give at least one assembly number, or --render FILE.json")
+
+    def export_dir(flag, kind, disabled, fallback):
+        """--export-X semantics: absent -> the configured folder (or off);
+        bare flag -> configured folder, else a local fallback; DIR -> DIR."""
+        if disabled or flag is None:
+            return None
+        return flag or config.folder(kind) or str(here / fallback)
+
+    pdf_dir = export_dir(args.export_drawings, "pdf", args.no_export_drawings, "drawings")
+    step_dir = export_dir(args.export_step, "step", args.no_export_step, "step")
 
     access = os.environ.get("ONSHAPE_ACCESS_KEY")
     secret = os.environ.get("ONSHAPE_SECRET_KEY")
@@ -782,38 +919,41 @@ def main(argv=None):
                 )
                 continue
 
-            if args.export_drawings and result.get("assembly"):
+            if pdf_dir and result.get("assembly"):
                 # Flat, like the DXF/SAT folders - not one subfolder per
                 # assembly - so this is a real shared archive: exporting the
-                # same part from two assemblies just re-saves the same file.
-                out_dir = Path(args.export_drawings)
+                # same part from two assemblies just re-saves the same file,
+                # and anything already there at its current rev is reused.
+                out_dir = Path(pdf_dir)
                 print(f"  exporting drawing PDFs to {out_dir} ...")
 
                 def progress(done, total, _pn=asm_pn):
-                    print(f"    {_pn}: {done}/{total} drawings exported", end="\r")
+                    print(f"    {_pn}: {done}/{total} drawings checked", end="\r")
 
                 entries = export_assembly_drawings(
                     client, result, out_dir, workers=args.drawing_workers,
-                    on_progress=progress,
+                    on_progress=progress, force=args.force_export,
                 )
                 print()  # clear the \r progress line
                 # The zip is a one-off snapshot of this run, not part of the
                 # permanent archive, so it stays next to the report - not in
                 # the shared K: folder alongside everyone's individual PDFs.
                 zip_path = zip_pdfs(entries, here / f"{asm_pn}-drawings.zip")
-                failed = [e for e in entries if e["error"]]
-                print(f"    {len(entries) - len(failed)} exported, {len(failed)} failed"
+                ok, skipped, failed = export_counts(entries)
+                print(f"    {ok} exported, {skipped} already there, {failed} failed"
                      + (f", zipped to {zip_path}" if zip_path else ""))
                 result["drawingExport"] = {
                     "entries": entries, "zipPath": str(zip_path) if zip_path else None,
                 }
 
-            if args.export_step and result.get("assembly"):
-                step_dir = Path(args.export_step)
+            if step_dir and result.get("assembly"):
                 print(f"  exporting STEP file to {step_dir} ...")
-                entry = export_assembly_step_file(client, result, step_dir)
+                entry = export_assembly_step_file(client, result, Path(step_dir),
+                                                  force=args.force_export)
                 if entry and entry["error"]:
                     print(f"    failed: {entry['error']}")
+                elif entry and entry.get("skipped"):
+                    print(f"    already there: {entry['path']}")
                 elif entry:
                     print(f"    exported to {entry['path']}")
                 result["stepExport"] = entry
@@ -833,24 +973,27 @@ def main(argv=None):
         print_summary(result)
         print()
 
-    report_html = render_report(results, base_url, folder_notes)
-    stamp_name = "revaudit-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".html"
+    # The JSON is the record - small, and re-renderable with --render; the
+    # HTML beside it is the same report rendered for reading now.
+    data = build_report(results, base_url, folder_notes)
+    report_html = render_data(data)
+    stamp = "revaudit-" + datetime.now().strftime("%Y%m%d-%H%M%S")
     if args.output:
-        out_path = Path(args.output)
+        out_path = Path(args.output).with_suffix(".html")
     else:
         # config's report folder (usually a K: share), falling back to here
-        import config
-        out_path = Path(config.report_dir()) / stamp_name
+        out_path = Path(config.report_dir()) / f"{stamp}.html"
     try:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        save_report(out_path.with_suffix(".json"), data)
         out_path.write_text(report_html, encoding="utf-8")
     except OSError as exc:
         if args.output:
             raise
         print(f"  {out_path.parent} not writable ({exc}); saving locally", file=sys.stderr)
-        out_path = here / stamp_name
+        out_path = here / f"{stamp}.html"
+        save_report(out_path.with_suffix(".json"), data)
         out_path.write_text(report_html, encoding="utf-8")
-    print(f"Report written to {out_path}")
+    print(f"Report written to {out_path}  (data: {out_path.with_suffix('.json').name})")
 
     if args.open_report:
         webbrowser.open(out_path.resolve().as_uri())

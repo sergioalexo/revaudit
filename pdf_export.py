@@ -96,29 +96,49 @@ def _collect_jobs(result):
     return jobs
 
 
-def export_assembly_drawings(client, result, out_dir, workers=4, on_progress=None):
+def _already_there(path):
+    """True when a non-empty file is already at path. A revision is immutable,
+    so a file named for it is the same file whenever it was made - fetching
+    it again would only spend Onshape API calls."""
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def export_assembly_drawings(client, result, out_dir, workers=4, on_progress=None,
+                             force=False):
     """Export PDFs for one audited assembly: its own drawing plus every part
     that has a released one. Returns a list of
-    {kind, pn, rev, path, error} - one entry per attempted export, in the
-    order jobs were submitted (not completion order)."""
+    {kind, pn, rev, path, error, skipped} - one entry per drawing, in the
+    order jobs were submitted (not completion order).
+
+    A drawing whose <pn>_Rev<rev>.pdf is already in out_dir is skipped
+    (skipped=True, no API call) unless force is set, so re-auditing an
+    assembly only fetches the drawings that changed since last time."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     jobs = _collect_jobs(result)
     if not jobs:
         return []
 
+    def target_for(job):
+        suffix = "_ASSEMBLY" if job["kind"] == "assembly" else ""
+        return out_dir / (f"{safe_filename(job['pn'])}_Rev{safe_filename(job['rev'])}"
+                          f"{suffix}.pdf")
+
     def run_one(job):
+        base = {k: job[k] for k in ("kind", "pn", "rev")}
+        path = target_for(job)
+        if not force and _already_there(path):
+            return {**base, "path": str(path), "error": None, "skipped": True}
         ids = job["ids"]
         try:
             data = export_pdf(client, ids["documentId"], ids["versionId"], ids["elementId"])
         except OnshapeError as exc:
-            return {**{k: job[k] for k in ("kind", "pn", "rev")}, "path": None,
-                    "error": str(exc)}
-        suffix = "_ASSEMBLY" if job["kind"] == "assembly" else ""
-        fname = f"{safe_filename(job['pn'])}_Rev{safe_filename(job['rev'])}{suffix}.pdf"
-        path = out_dir / fname
+            return {**base, "path": None, "error": str(exc), "skipped": False}
         path.write_bytes(data)
-        return {**{k: job[k] for k in ("kind", "pn", "rev")}, "path": str(path), "error": None}
+        return {**base, "path": str(path), "error": None, "skipped": False}
 
     entries = [None] * len(jobs)
     done = 0
@@ -132,24 +152,36 @@ def export_assembly_drawings(client, result, out_dir, workers=4, on_progress=Non
     return entries
 
 
-def export_assembly_step_file(client, result, out_dir):
+def export_assembly_step_file(client, result, out_dir, force=False):
     """Export one assembly's own 3D geometry to a single flat STEP file,
     named and located like the DXF/SAT/PDF folders. Unlike drawing PDFs this
     is one file per assembly (not one per part) - there is only one job to
-    run, so no thread pool. Returns {pn, rev, path, error}."""
+    run, so no thread pool. Returns {pn, rev, path, error, skipped}.
+
+    Like the drawings, an existing <asm>_Rev<rev>.step is reused rather than
+    fetched again unless force is set."""
     asm = result.get("assembly")
     if not asm:
         return None
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     pn, rev = result["partNumber"], asm.get("revision")
+    path = out_dir / f"{safe_filename(pn)}_Rev{safe_filename(rev)}.step"
+    if not force and _already_there(path):
+        return {"pn": pn, "rev": rev, "path": str(path), "error": None, "skipped": True}
     try:
         data = export_step(client, asm["documentId"], asm["versionId"], asm["elementId"])
     except OnshapeError as exc:
-        return {"pn": pn, "rev": rev, "path": None, "error": str(exc)}
-    path = out_dir / f"{safe_filename(pn)}_Rev{safe_filename(rev)}.step"
+        return {"pn": pn, "rev": rev, "path": None, "error": str(exc), "skipped": False}
     path.write_bytes(data)
-    return {"pn": pn, "rev": rev, "path": str(path), "error": None}
+    return {"pn": pn, "rev": rev, "path": str(path), "error": None, "skipped": False}
+
+
+def export_counts(entries):
+    """(exported, skipped, failed) totals for a list of export entries."""
+    failed = sum(1 for e in entries if e.get("error"))
+    skipped = sum(1 for e in entries if e.get("skipped"))
+    return len(entries) - failed - skipped, skipped, failed
 
 
 def zip_pdfs(entries, zip_path):

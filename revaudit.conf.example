@@ -45,7 +45,8 @@ sat  =
 pdf  =
 step =
 
-# Where finished HTML reports are saved, so anyone with drive access can
+# Where reports are saved (the audit data as .json; the web UI renders it on
+# demand, the CLI also writes the .html beside it), so anyone with drive access can
 # browse the audit history. Set it blank to keep reports in the RevAudit
 # app folder instead. If this folder can't be reached when a report is
 # written, RevAudit falls back to the app folder for that one.

@@ -201,6 +201,16 @@ def current_revision(items):
     return None
 
 
+def view_url(record):
+    """The Onshape URL that opens this revision record or BOM item source at
+    its exact version and configuration - Onshape supplies it as "viewRef" on
+    a revision and "viewHref" on a BOM line's itemSource, so nothing has to
+    be assembled by hand. None when the record carries neither."""
+    if not record:
+        return None
+    return record.get("viewRef") or record.get("viewHref") or None
+
+
 def drawing_ids(revision):
     """documentId/versionId/elementId for a revision dict, or None if any are
     missing - used to locate a drawing for PDF export without a second API
@@ -261,6 +271,9 @@ def normalize_bom(payload):
             "state": (flat.get("STATE") or "").strip().upper() or None,
             "qty": flat.get("QTY") or flat.get("QUANTITY"),
             "material": flat.get("MATERIAL"),
+            # opens this exact line - the version and configuration the
+            # assembly actually references - in Onshape
+            "url": view_url(row.get("itemSource")),
         })
 
     def order(r):

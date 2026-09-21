@@ -1,7 +1,8 @@
 # RevAudit
 
 Command-line tool that runs the release / drawing / DXF checks against Onshape's REST
-API and writes a self-contained HTML report.
+API and writes a report. Every part, assembly and drawing in the report links straight
+to that exact released revision and configuration in Onshape.
 
 For each assembly part number it reports:
 
@@ -104,7 +105,7 @@ Plain text, safe to read, opens in Notepad. Restart RevAudit after editing.
 | `bind_host` | `0.0.0.0` = reachable from the LAN (needs a password in `.env`); `127.0.0.1` = this machine only. |
 | `port` | Default `8000`. |
 | `[folders]` dxf / sat / pdf / step | Where the production files live. Prefer a UNC path (`\\server\share\...`) over a mapped drive (`K:`) if RevAudit runs at logon — drive letters only exist while you're signed in. |
-| `[folders]` report | Where finished HTML reports are saved, so anyone with drive access can browse the audit history. Blank = keep them in the app folder. If the folder is unreachable when a report is written, that one falls back to the app folder. |
+| `[folders]` report | Where reports are saved — the audit data as `.json`, rendered to HTML on demand (the CLI also writes the `.html` beside it) — so anyone with drive access can browse the audit history. Blank = keep them in the app folder. If the folder is unreachable when a report is written, that one falls back to the app folder. |
 
 Every value also accepts an environment variable (`REVAUDIT_BIND_HOST`, `REVAUDIT_DXF_DIR`, …)
 and falls back to a built-in default, so an old `.env`-only setup keeps working untouched.
@@ -145,16 +146,61 @@ py -3.13 revaudit.py ASM-12345
 | `--sat-recursive` | Search that folder's subfolders too. Off by default. |
 | `--sat-ext .sat` | Extensions to index. Default `.sat`. |
 | `--sat-material-regex` | Which materials require a SAT file. Default `TUBE`. |
-| `--export-drawings [DIR]` | Export a PDF of every released drawing (see below). Omit to skip. |
+| `--export-drawings [DIR]` | Export a PDF of every released drawing (see below). **On by default when `[folders] pdf` is configured**; `DIR` overrides the folder. |
+| `--no-export-drawings` | Skip the PDF export for this run. |
 | `--drawing-workers N` | Parallel PDF exports, default 4. |
-| `--export-step [DIR]` | Export each assembly's 3D geometry as STEP (see below). Omit to skip. |
-| `-o, --output FILE` | Report path. Without it, a timestamped file goes to `[folders] report` in `revaudit.conf`, or the app folder if that's unreachable or unset. |
+| `--export-step [DIR]` | Export each assembly's 3D geometry as STEP (see below). **On by default when `[folders] step` is configured**; `DIR` overrides the folder. |
+| `--no-export-step` | Skip the STEP export for this run. |
+| `--force-export` | Re-fetch PDFs/STEP files even when the file is already in the folder at the current revision. |
+| `-o, --output FILE` | Report path. The audit data is saved as `FILE`'s `.json` twin and the HTML rendered next to it. Without it, timestamped files go to `[folders] report` in `revaudit.conf`, or the app folder if that's unreachable or unset. |
+| `--render FILE.json` | Re-render the HTML from a saved report's data — no Onshape calls, no credentials needed. `-o` picks the output path. |
 | `--open` | Open the finished report in your browser. |
 | `--base-url URL` | Onshape URL, if not set in `.env`. |
 | `--company-id ID` | Skip company auto-detection. |
 | `--workers N` | Parallel API lookups, default 6. Lower it if you hit rate limits. |
 | `--no-deep` | Skip the extra element-type sweep on parts that appear to have no drawing. |
 | `-v` | Log every API call. |
+
+## Reports are stored as data, rendered on demand
+
+A run saves its result as **JSON** — `revaudit-<timestamp>-<token>.json` in the report
+folder — and the HTML you look at is rendered from that file. The web UI renders it every
+time someone opens `/report/<id>`; the CLI writes the HTML next to the JSON and can
+regenerate it any time with `--render`. So the stored record is the audit itself (BOM
+lines, every part's current part/drawing revision, every finding, the Onshape links),
+not a frozen page: when the report layout improves, old audits pick it up on the next
+open, and the data can be read by anything that speaks JSON (`format: 1` in the file).
+
+In the web UI the share bar has a **data (.json)** link beside the report link — same
+unguessable token, same no-password access. Reports made before this change were saved
+as finished HTML; they still open exactly as before, they just have no data twin.
+
+Each stored report looks like:
+
+```json
+{"app": "RevAudit", "format": 1, "generated": "2026-09-21 08:33",
+ "baseUrl": "https://yourcompany.onshape.com",
+ "folderNotes": ["DXF folder <share>\\DXF FILES"],
+ "results": [ {"partNumber": "ASM-12345", "assembly": {...}, "rows": [...],
+               "partStatuses": {...}, "findings": {...}, "drawingExport": {...}} ]}
+```
+
+## Links into Onshape
+
+Every part number, revision and BOM line in the report carries a small **↗** that opens
+that item in Onshape at **the exact version and configuration the audit looked at** —
+not the live workspace. Onshape supplies these itself: a revision record's `viewRef` and
+a BOM line's `itemSource.viewHref` already encode the document, version, element and
+`?configuration=` string, so the audit just carries them through. That means:
+
+- the assembly header links the released assembly version and its released drawing;
+- a "drawing behind part" row links both the current part revision *and* the lagging
+  drawing revision, so you can open the two side by side;
+- BOM lines (full BOM, obsolete, mixed-revision, unmanaged) link the item the assembly
+  actually references — including a configured part's specific configuration;
+- DXF/SAT gaps link the part whose file is missing.
+
+Click the part number itself to copy it; click the arrow to open it.
 
 ## How the checks work
 
@@ -183,13 +229,22 @@ Same for SAT.
 
 ## PDF drawing export
 
-`--export-drawings [DIR]` on the CLI, or the "PDF export folder" field in the web UI,
-exports a PDF of every drawing in the audited assembly — its own, plus every part that
-has one — into that folder.
+Every drawing in the audited assembly — its own, plus every part that has one — is
+exported as a PDF into the configured folder. **On by default** in both the CLI and the
+web UI whenever `[folders] pdf` (or `REVAUDIT_PDF_DIR`) is set; `--no-export-drawings`
+or unticking the box skips it for one run, `--export-drawings DIR` points it elsewhere.
 
 ```bash
 py -3.13 revaudit.py ASM-12345 --export-drawings "<share>\PDF FILES" --drawing-workers 6
 ```
+
+**A drawing already in the folder at its current revision is not fetched again.** A
+revision is immutable, so `PRT-12345_RevB.pdf` is the same file whenever it was made;
+re-auditing an assembly only spends Onshape translation calls on the drawings that have
+actually moved on since the last run (the report says how many were reused). That is
+what makes leaving the export on cost nothing in steady state. `--force-export` (or the
+"re-fetch" box in the web UI) overrides it; an empty file is never trusted and is
+re-fetched regardless.
 
 **The destination is a real, permanent archive, not a one-off dump** — files are saved
 flat, named exactly like the DXF/SAT folders (`<part number>_Rev<rev>.pdf`, and the
@@ -200,11 +255,12 @@ free dedup. Default location: `REVAUDIT_PDF_DIR` in `.env` / `[folders] pdf` in
 `revaudit.conf`. **The folder is created automatically on first export if it
 doesn't already exist** - worth knowing before pointing this at a shared drive.
 
-Each drawing costs one Onshape translation round trip (POST a translation job at the
-part's exact released version, poll until done, download the result), so this is the
-slow part of a run — budget roughly a second per drawing. A 68-part assembly takes
-about a minute and a half with the default worker count. One failed drawing doesn't
-lose the rest: it's reported by itself and everything else still exports.
+Each drawing that does need fetching costs one Onshape translation round trip (POST a
+translation job at the part's exact released version, poll until done, download the
+result), so this is the slow part of a first run — budget roughly a second per drawing.
+A 68-part assembly takes about a minute and a half with the default worker count the
+first time, and seconds after that. One failed drawing doesn't lose the rest: it's
+reported by itself and everything else still exports.
 
 Every export is version-scoped to the same revision the audit already resolved, so the
 PDF always matches what was actually checked — never the live workspace.
@@ -219,9 +275,11 @@ but a "here's what I sent Dave on Tuesday" zip snapshot doesn't.
 
 ## STEP export (3D geometry)
 
-`--export-step [DIR]` on the CLI, or the checkbox + folder field in the web UI, exports
-each audited assembly's **own 3D geometry** — one STEP file per assembly, not per part —
-so it can be opened and viewed outside Onshape. Off by default in both places.
+Each audited assembly's **own 3D geometry** — one STEP file per assembly, not per part —
+is exported so it can be opened and viewed outside Onshape. Like the PDFs, **on by
+default** whenever `[folders] step` (or `REVAUDIT_STEP_DIR`) is set, and skipped without
+an API call when `<assembly>_Rev<rev>.step` is already in the folder. `--no-export-step`
+or the checkbox turns it off for a run; `--export-step DIR` redirects it.
 
 ```bash
 py -3.13 revaudit.py ASM-12345 --export-step "<share>\STEP FILES"
@@ -256,7 +314,7 @@ the download link, so nobody has to remember this paragraph.
 
 | File | Purpose |
 |---|---|
-| `revaudit.py` | CLI entry point, HTML report renderer |
+| `revaudit.py` | CLI entry point, report data (JSON) + HTML renderer |
 | `serve.py` | Single-user web UI, API key from `.env` |
 | `oauth_app.py` | Multi-user web app, everyone signs in with their own Onshape account |
 | `import_key.py` | Imports credentials from a text file into `.env` |

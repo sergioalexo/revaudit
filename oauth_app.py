@@ -45,17 +45,19 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from audit_core import DxfIndex, audit_assembly
+from audit_core import audit_assembly
 from onshape_client import DEFAULT_BASE_URL, OnshapeClient, OnshapeError
-from revaudit import APP_NAME, CSS, credit_html, load_dotenv, render_report
-from serve import (FORM_CSS, find_report, form_page, get_dxf_index,
-                   handle_index_upload, page, with_back_link, write_report)
+from revaudit import (APP_NAME, CSS, build_report, credit_html, load_dotenv,
+                      load_report, render_data)
+from serve import (FORM_CSS, build_file_checks, find_report, folder_notes_for,
+                   form_page, handle_index_upload, new_report_id, page,
+                   parse_run_form, report_id, run_exports, with_back_link,
+                   write_report)
 
 HERE = Path(__file__).resolve().parent
 
@@ -350,13 +352,20 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/report/"):
             name = path[len("/report/"):]
-            target = find_report(name)
-            if (name in session.get("reports", [])
-                    and re.fullmatch(r"revaudit-[\w.-]+\.html", name)
-                    and target is not None):
-                return self._send(target.read_bytes())
-            # another user's report, or one from before this session
-            return self._send(page("Not found", "<h1>Report not found</h1>"), 404)
+            rid = report_id(name)
+            target = find_report(name) if re.fullmatch(r"revaudit-[\w.-]+", name) else None
+            # only this user's own reports - another user's, or one from
+            # before this session, may cover documents they cannot see
+            if rid not in session.get("reports", []) or target is None:
+                return self._send(page("Not found", "<h1>Report not found</h1>"), 404)
+            if target.suffix == ".json":
+                if name.endswith(".json"):
+                    return self._send(target.read_bytes(), 200,
+                                      "application/json; charset=utf-8")
+                body = with_back_link(render_data(load_report(target)), str(target))
+                return self._send(body.replace(
+                    "<div class='wrap'>", "<div class='wrap'>" + header_for(session), 1))
+            return self._send(target.read_bytes())
 
         return self._send(page("Not found", "<h1>Not found</h1>"), 404)
 
@@ -371,13 +380,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(page("Not found", "<h1>Not found</h1>"), 404)
 
         length = int(self.headers.get("Content-Length") or 0)
-        fields = parse_qs(self.rfile.read(length).decode("utf-8"))
-        values = {
-            "assemblies": (fields.get("assemblies", [""])[0]).strip(),
-            "dxf_dir": (fields.get("dxf_dir", [""])[0]).strip(),
-            "material_regex": (fields.get("material_regex", ["^SHEET AL"])[0]).strip(),
-            "dxf_recursive": bool(fields.get("dxf_recursive")),
-        }
+        values = parse_run_form(parse_qs(self.rfile.read(length).decode("utf-8")))
         names = [n for n in re.split(r"[\s,]+", values["assemblies"]) if n]
         if not names:
             return self._send(form_page(values, "Enter at least one assembly number.",
@@ -393,35 +396,32 @@ class Handler(BaseHTTPRequestHandler):
                         "No Onshape company is associated with this account.")
                 company_id = session["company_id"] = companies[0]["id"]
 
-            dxf_index = None
-            if values["dxf_dir"]:
-                dxf_index = get_dxf_index(values["dxf_dir"], values["dxf_recursive"])
-            material_re = re.compile(values["material_regex"] or "^SHEET AL", re.I)
-
+            file_checks = build_file_checks(values)
             results = []
             for name in names:
                 print(f"  [{session.get('name')}] auditing {name} ...", file=sys.stderr)
                 try:
                     results.append(audit_assembly(
-                        client, company_id, name, dxf_index, material_re,
-                        workers=6, deep=True,
+                        client, company_id, name, file_checks, workers=6, deep=True,
                     ))
                 except OnshapeError as exc:
                     results.append(
                         {"partNumber": name, "errors": [str(exc)], "findings": {}})
+            host = self.headers.get("Host", f"localhost:{self.server.server_port}")
+            run_exports(results, client, host, values)
         except OnshapeError as exc:
             return self._send(form_page(values, str(exc)))
         except Exception as exc:                                  # noqa: BLE001
             traceback.print_exc()
             return self._send(form_page(values, f"{type(exc).__name__}: {exc}"))
 
-        report = render_report(results, CONFIG["base_url"], values["dxf_dir"] or None)
-        name = "revaudit-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".html"
-        saved = write_report(name, report)
-        session.setdefault("reports", []).append(name)
-        body = with_back_link(report, str(saved)).replace(
+        data = build_report(results, CONFIG["base_url"], folder_notes_for(values))
+        rid = new_report_id()
+        saved = write_report(rid, data)
+        session.setdefault("reports", []).append(rid)
+        body = with_back_link(render_data(data), str(saved)).replace(
             "<div class='wrap'>", "<div class='wrap'>" + header_for(session), 1)
-        self._send(body)
+        self._send(body.encode("utf-8"))
 
 
 # --------------------------------------------------------------------------

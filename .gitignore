@@ -1,6 +1,7 @@
 .env
 access.txt
 revaudit-*.html
+revaudit-*.json
 __pycache__/
 *.pyc
 dxf-index.json
