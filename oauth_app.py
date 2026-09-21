@@ -52,8 +52,8 @@ from urllib.parse import parse_qs, urlparse
 
 from audit_core import audit_assembly
 from onshape_client import DEFAULT_BASE_URL, OnshapeClient, OnshapeError
-from revaudit import (APP_NAME, CSS, build_report, credit_html, load_dotenv,
-                      load_report, render_data)
+from revaudit import (APP_NAME, CSS, build_report, credit_html, data_json,
+                      load_dotenv, load_report, render_data)
 from serve import (FORM_CSS, build_file_checks, find_report, folder_notes_for,
                    form_page, handle_index_upload, new_report_id, page,
                    parse_run_form, report_id, run_exports, with_back_link,
@@ -358,14 +358,16 @@ class Handler(BaseHTTPRequestHandler):
             # before this session, may cover documents they cannot see
             if rid not in session.get("reports", []) or target is None:
                 return self._send(page("Not found", "<h1>Report not found</h1>"), 404)
-            if target.suffix == ".json":
-                if name.endswith(".json"):
-                    return self._send(target.read_bytes(), 200,
-                                      "application/json; charset=utf-8")
-                body = with_back_link(render_data(load_report(target)), str(target))
-                return self._send(body.replace(
-                    "<div class='wrap'>", "<div class='wrap'>" + header_for(session), 1))
-            return self._send(target.read_bytes())
+            try:
+                data = load_report(target)
+            except ValueError:
+                return self._send(target.read_bytes())      # pre-data HTML
+            if name.endswith(".json"):
+                return self._send(data_json(data).encode("utf-8"), 200,
+                                  "application/json; charset=utf-8")
+            body = with_back_link(render_data(data), str(target))
+            return self._send(body.replace(
+                "<div class='wrap'>", "<div class='wrap'>" + header_for(session), 1))
 
         return self._send(page("Not found", "<h1>Not found</h1>"), 404)
 

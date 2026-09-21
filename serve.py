@@ -37,8 +37,9 @@ from onshape_client import DEFAULT_BASE_URL, OnshapeClient, OnshapeError
 from pdf_export import (export_assembly_drawings, export_assembly_step_file,
                         export_counts, safe_filename, zip_pdfs)
 import config
-from revaudit import (APP_NAME, CSS, build_report, credit_html, load_dotenv,
-                      load_report, render_data, report_name_part, save_report)
+from revaudit import (APP_NAME, CSS, build_report, credit_html, data_json,
+                      load_dotenv, load_report, render_data, report_name_part,
+                      save_report)
 
 HERE = Path(__file__).resolve().parent
 config.ensure_from_example()          # so `launch.bat` alone still works
@@ -47,15 +48,14 @@ DEFAULT_SAT_DIR = config.folder("sat")
 DEFAULT_PDF_DIR = config.folder("pdf")
 DEFAULT_STEP_DIR = config.folder("step")
 
-# A report is stored as revaudit-<timestamp>-<assemblies>-<random token>.json
-# - the audit data only - and rendered to HTML whenever someone opens
-# /report/<that id>. The token (exactly 16 url-safe chars, always last) is
-# what makes a report link safe to hand out without also handing out the site
-# password: nobody can guess it, so holding the link is proof enough that you
-# were given it. The same id with .json appended returns the raw data; with
-# .html it serves a report saved before JSON storage existed (those were
-# written as finished HTML) or renders the JSON if there is none. Names from
-# before the assemblies were in them (revaudit-<timestamp>-<token>) still fit.
+# A report is stored as revaudit-<timestamp>-<assemblies>-<random token>.html
+# - the finished page with the audit data embedded in it - and re-rendered
+# from that data whenever someone opens /report/<that id>. The token (exactly
+# 16 url-safe chars, always last) is what makes a report link safe to hand
+# out without also handing out the site password: nobody can guess it, so
+# holding the link is proof enough that you were given it. The same id with
+# .json appended returns just the data. Names from before the assemblies
+# were in them (revaudit-<timestamp>-<token>) still fit.
 TOKEN_CHARS = 16                                  # secrets.token_urlsafe(12)
 SHARED_REPORT_RE = (r"revaudit-\d{8}-\d{6}-(?:[A-Za-z0-9.+-]+-)?[A-Za-z0-9_-]{16}"
                     r"(?:\.json|\.html)?")
@@ -68,7 +68,8 @@ SHARED_REPORT_RE = (r"revaudit-\d{8}-\d{6}-(?:[A-Za-z0-9.+-]+-)?[A-Za-z0-9_-]{16
 # tokened one: a shared name always has '-' there.
 LEGACY_REPORT_RE = r"revaudit-\d{8}-\d{6}(?:_[A-Za-z0-9.+-]+)?(?:\.json|\.html)?"
 
-REPORT_EXTS = (".json", ".html")
+# .json: files from the few hours the data was stored bare; still readable
+REPORT_EXTS = (".html", ".json")
 
 
 def new_report_id(part_numbers=()):
@@ -117,12 +118,12 @@ def report_dirs():
 
 
 def write_report(rid, data):
-    """Save a report's data as <rid>.json, preferring the configured folder,
-    falling back to the app folder if that can't be written. Returns the
-    Path actually used."""
+    """Save a report as <rid>.html (data embedded), preferring the configured
+    folder, falling back to the app folder if that can't be written. Returns
+    the Path actually used."""
     for target_dir in report_dirs():
         try:
-            return save_report(target_dir / f"{rid}.json", data)
+            return save_report(target_dir / f"{rid}.html", data)
         except OSError as exc:
             print(f"  report folder {target_dir} not writable ({exc}); trying next",
                   file=sys.stderr)
@@ -130,9 +131,8 @@ def write_report(rid, data):
 
 
 def find_report(name):
-    """The file behind `name` - a full revaudit-*.json / .html filename, or a
-    bare report id (its .json is preferred, then a legacy .html) - wherever
-    it lives, or None."""
+    """The file behind `name` - a full revaudit-*.html / .json filename, or a
+    bare report id (.html preferred) - wherever it lives, or None."""
     names = [name] if name.endswith(REPORT_EXTS) else [name + e for e in REPORT_EXTS]
     for d in report_dirs():
         for candidate_name in names:
@@ -147,7 +147,7 @@ def find_report(name):
 
 def list_reports(limit=5):
     """The most recent reports across every report folder, newest first, one
-    entry per report id (a CLI run leaves a .json and an .html side by side)."""
+    entry per report id (the JSON-file interlude left .json and .html twins)."""
     seen = {}
     for d in report_dirs():
         for ext in REPORT_EXTS:
@@ -591,27 +591,33 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(page("Not found", "<h1>Not found</h1>"), 404)
 
     def _serve_report(self, name):
-        """/report/<id> renders the stored JSON; /report/<id>.json returns it
-        raw; /report/<id>.html serves a pre-JSON report saved as HTML, or
-        renders the JSON when only that exists."""
-        target = find_report(name)      # searches the report folder + app folder
-        if target is None and name.endswith(".html"):
-            target = find_report(report_id(name))     # .html asked, only .json kept
+        """/report/<id> (or .html) re-renders the report from the data
+        embedded in the saved file; /report/<id>.json returns that data. A
+        report saved before data was embedded is served as it was written."""
+        target = find_report(report_id(name) if name.endswith(REPORT_EXTS) else name)
+        if target is None:
+            target = find_report(name)
         if target is None:
             return self._send(page("Not found", "<h1>Report not found</h1>"), 404)
-        if target.suffix == ".json":
-            if name.endswith(".json"):
-                return self._send(target.read_bytes(), 200, "application/json; charset=utf-8")
-            try:
-                data = load_report(target)
-            except (OSError, ValueError) as exc:
-                return self._send(page("Error", f"<h1>Unreadable report</h1>"
-                                       f"<div class='err'>{html.escape(str(exc))}</div>"), 500)
-            rid = report_id(target.name)
-            body = with_back_link(render_data(data), str(target),
-                                  *self._share_urls(rid))
-            return self._send(body.encode("utf-8"))
-        return self._send(target.read_bytes())
+        try:
+            data = load_report(target)
+        except ValueError:
+            data = None                       # pre-data HTML: nothing to re-render
+        except OSError as exc:
+            return self._send(page("Error", f"<h1>Unreadable report</h1>"
+                                   f"<div class='err'>{html.escape(str(exc))}</div>"), 500)
+        if name.endswith(".json"):
+            if data is None:
+                return self._send(page("Not found", "<h1>This report has no data block</h1>"
+                                       "<p>It was saved before reports carried their data.</p>"),
+                                  404)
+            return self._send(data_json(data).encode("utf-8"), 200,
+                              "application/json; charset=utf-8")
+        if data is None:
+            return self._send(target.read_bytes())
+        rid = report_id(target.name)
+        body = with_back_link(render_data(data), str(target), *self._share_urls(rid))
+        return self._send(body.encode("utf-8"))
 
     def _share_urls(self, rid):
         """(page url, data url) for a report id, built from the Host header the

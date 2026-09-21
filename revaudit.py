@@ -539,10 +539,10 @@ def render_assembly(result):
 
 
 def build_report(results, base_url, folder_notes=None, generated=None):
-    """Everything a report needs, as one JSON-serialisable dict. This is what
-    gets saved to disk; the HTML is rendered from it on demand, so the stored
-    record stays small and a later version of the renderer can re-render an
-    old audit with whatever the report looks like by then.
+    """Everything a report needs, as one JSON-serialisable dict. It travels
+    inside the saved HTML (see render_data / load_report), so a report file
+    is both the page you double-click and the data a later version of the
+    renderer can re-render with whatever the report looks like by then.
 
     folder_notes: list of "Label path" strings shown in the subtitle, e.g.
     ["DXF folder K:\\...\\DXF FILES", "SAT folder K:\\...\\SAT FILES"]. A bare
@@ -559,21 +559,56 @@ def build_report(results, base_url, folder_notes=None, generated=None):
     }
 
 
+# The report data rides inside the HTML in this block, so one file is both
+# the readable page and the record. type=application/json means the browser
+# never runs it; only "</" needs escaping so the block can't end early.
+DATA_TAG_OPEN = '<script type="application/json" id="revaudit-data">'
+DATA_TAG_CLOSE = "</script>"
+_DATA_BLOCK_RE = re.compile(re.escape(DATA_TAG_OPEN) + r"(.*?)" + re.escape(DATA_TAG_CLOSE),
+                            re.DOTALL)
+
+
+def data_json(data):
+    """Compact JSON for embedding or for the /report/<id>.json endpoint."""
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+
+
+def data_block(data):
+    return DATA_TAG_OPEN + data_json(data).replace("</", "<\\/") + DATA_TAG_CLOSE
+
+
 def save_report(path, data):
-    """Write report data as compact JSON. Returns the Path."""
+    """Write the report as a self-contained .html with its data embedded.
+    Returns the Path."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, separators=(",", ":"), ensure_ascii=False),
-                    encoding="utf-8")
+    path.write_text(render_data(data), encoding="utf-8")
     return path
 
 
+def extract_data(html_text):
+    """The embedded report data from rendered HTML, or None if it has none
+    (a report saved before data was embedded)."""
+    m = _DATA_BLOCK_RE.search(html_text)
+    if not m:
+        return None
+    data = json.loads(m.group(1))
+    return data if isinstance(data, dict) and "results" in data else None
+
+
 def load_report(path):
-    """Read report data saved by save_report. Raises ValueError if the file
-    is not a RevAudit report."""
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or "results" not in data:
+    """Read report data back from a saved .html (embedded block) or from a
+    bare .json written by the short-lived JSON-file format. Raises
+    ValueError if the file is neither."""
+    text = Path(path).read_text(encoding="utf-8")
+    if text.lstrip().startswith("{"):
+        data = json.loads(text)
+        if isinstance(data, dict) and "results" in data:
+            return data
         raise ValueError(f"{path} is not a {APP_NAME} report")
+    data = extract_data(text)
+    if data is None:
+        raise ValueError(f"{path} has no embedded {APP_NAME} data")
     return data
 
 
@@ -666,7 +701,7 @@ def render_data(data):
         "Click any part number or filename to copy it; the &#8599; beside it opens that "
         "exact revision and configuration in Onshape."
         "<p style='margin-top:14px'>" + credit_html(f"{APP_NAME} &middot; ") + "</p>"
-        "</footer>" + COPY_SCRIPT + "</div></body></html>"
+        "</footer>" + COPY_SCRIPT + "</div>" + data_block(data) + "</body></html>"
     )
     return "".join(parts)
 
@@ -767,14 +802,16 @@ def main(argv=None):
             '  py -3.13 revaudit.py ASM-12345 --dxf-dir "<share>\\DXF FILES" '
             '--sat-dir "<share>\\SAT FILES" --open\n'
             "  py -3.13 revaudit.py ASM-1 ASM-2 ASM-3 -o audit.html\n"
-            "  py -3.13 revaudit.py --render reports/revaudit-20260921-1405.json --open\n"
+            "  py -3.13 revaudit.py --render reports/revaudit-20260921-1405_ASM-1.html --open\n"
         ),
     )
     parser.add_argument("assemblies", nargs="*", metavar="ASM",
                         help="assembly part numbers, e.g. ASM-12345")
-    parser.add_argument("--render", metavar="FILE.json",
-                        help="re-render the HTML report from a saved report's JSON "
-                             "data instead of running an audit - no Onshape calls")
+    parser.add_argument("--render", metavar="FILE",
+                        help="re-render a saved report (its embedded data, or a bare "
+                             ".json) with the current layout instead of running an "
+                             "audit - no Onshape calls. Overwrites FILE unless -o is "
+                             "given")
     parser.add_argument("--dxf-dir", metavar="PATH",
                         help="folder to check for DXF files (omit to skip the DXF check)")
     parser.add_argument("--dxf-recursive", action="store_true",
@@ -823,10 +860,9 @@ def main(argv=None):
                         help="re-fetch PDFs/STEP files even when they are already in "
                              "the folder")
     parser.add_argument("-o", "--output", metavar="FILE",
-                        help="report path; the audit data is saved as FILE's .json "
-                             "twin and the HTML rendered next to it (default: "
-                             "revaudit-<timestamp>.json + .html in the configured "
-                             "report folder)")
+                        help="report path - one self-contained .html with the audit "
+                             "data embedded (default: revaudit-<timestamp>_<asm>.html "
+                             "in the configured report folder)")
     parser.add_argument("--open", action="store_true", dest="open_report",
                         help="open the report in the browser when done")
     parser.add_argument("--base-url", help="Onshape base URL (or ONSHAPE_BASE_URL)")
@@ -846,14 +882,13 @@ def main(argv=None):
             print(f"Cannot render {args.render}: {exc}", file=sys.stderr)
             return 2
         out_path = Path(args.output) if args.output else Path(args.render).with_suffix(".html")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(render_data(data), encoding="utf-8")
+        save_report(out_path, data)
         print(f"Report written to {out_path}")
         if args.open_report:
             webbrowser.open(out_path.resolve().as_uri())
         return 0
     if not args.assemblies:
-        parser.error("give at least one assembly number, or --render FILE.json")
+        parser.error("give at least one assembly number, or --render FILE")
 
     def export_dir(flag, kind, disabled, fallback):
         """--export-X semantics: absent -> the configured folder (or off);
@@ -989,10 +1024,9 @@ def main(argv=None):
         print_summary(result)
         print()
 
-    # The JSON is the record - small, and re-renderable with --render; the
-    # HTML beside it is the same report rendered for reading now.
+    # One self-contained .html: the page, with the audit data embedded so it
+    # can be re-rendered (--render) or read as data later.
     data = build_report(results, base_url, folder_notes)
-    report_html = render_data(data)
     # revaudit-<stamp>_<assemblies>: the '_' after the stamp is what tells the
     # web UI this is a CLI file with no share token in its name (see serve.py).
     stamp = ("revaudit-" + datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1003,16 +1037,14 @@ def main(argv=None):
         # config's report folder (usually a K: share), falling back to here
         out_path = Path(config.report_dir()) / f"{stamp}.html"
     try:
-        save_report(out_path.with_suffix(".json"), data)
-        out_path.write_text(report_html, encoding="utf-8")
+        save_report(out_path, data)
     except OSError as exc:
         if args.output:
             raise
         print(f"  {out_path.parent} not writable ({exc}); saving locally", file=sys.stderr)
         out_path = here / f"{stamp}.html"
-        save_report(out_path.with_suffix(".json"), data)
-        out_path.write_text(report_html, encoding="utf-8")
-    print(f"Report written to {out_path}  (data: {out_path.with_suffix('.json').name})")
+        save_report(out_path, data)
+    print(f"Report written to {out_path}")
 
     if args.open_report:
         webbrowser.open(out_path.resolve().as_uri())

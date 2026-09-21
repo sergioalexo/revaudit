@@ -13,8 +13,8 @@ from audit_core import audit_assembly
 from pdf_export import (_collect_jobs, export_assembly_drawings,
                         export_assembly_step_file, export_counts, safe_filename)
 from onshape_client import OnshapeError, normalize_bom, rev_lt
-from revaudit import (build_report, load_report, render_data, report_name_part,
-                      save_report)
+from revaudit import (build_report, extract_data, load_report, render_data,
+                      report_name_part, save_report)
 
 # --------------------------------------------------------------------------
 # a mock Onshape backend shaped exactly like the real payloads
@@ -297,10 +297,17 @@ def main():
     check("format tag", data["format"], 1)
     check("json-serialisable", isinstance(json.dumps(data), str), True)
     with tempfile.TemporaryDirectory() as tmp:
-        path = save_report(Path(tmp) / "r.json", data)
+        path = save_report(Path(tmp) / "r.html", data)
+        text = path.read_text(encoding="utf-8")
+        check("saved file is a page", text.startswith("<!doctype html>"), True)
+        check("saved page embeds the data", 'id="revaudit-data"' in text, True)
         loaded = load_report(path)
         check("round trip keeps results", loaded["results"][0]["partNumber"], "ASM-TEST")
         check("round trip keeps generated stamp", loaded["generated"], data["generated"])
+        check("round trip is lossless", loaded == json.loads(json.dumps(data)), True)
+        (Path(tmp) / "bare.json").write_text(json.dumps(data), encoding="utf-8")
+        check("bare .json (interim format) still loads",
+              load_report(Path(tmp) / "bare.json")["results"][0]["partNumber"], "ASM-TEST")
         html = render_data(loaded)
         check("rendered report names the assembly", '<h2 id="ASM-TEST">' in html, True)
         check("rendered report shows the stored timestamp",
@@ -320,6 +327,21 @@ def main():
             check("non-report json rejected", False, True)
         except ValueError:
             check("non-report json rejected", True, True)
+        try:
+            (Path(tmp) / "old.html").write_text("<!doctype html><h1>RevAudit</h1>",
+                                                encoding="utf-8")
+            load_report(Path(tmp) / "old.html")
+            check("pre-data html rejected", False, True)
+        except ValueError:
+            check("pre-data html rejected", True, True)
+    # a part name that tries to close the data block must not break it
+    hostile = json.loads(json.dumps(res))
+    hostile["rows"][0]["name"] = 'x</script><script>alert(1)</script>'
+    page = render_data(build_report([hostile], "https://cad.example"))
+    back = extract_data(page)
+    check("</script> inside data survives the round trip",
+          back["results"][0]["rows"][0]["name"], hostile["rows"][0]["name"])
+    check("no live script injected", "<script>alert(1)</script>" in page, False)
     # a report saved before links existed still renders, just without arrows
     bare = json.loads(json.dumps(res))
     bare["assembly"].pop("url")

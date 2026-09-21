@@ -120,7 +120,7 @@ Plain text, safe to read, opens in Notepad. Restart RevAudit after editing.
 | `bind_host` | `0.0.0.0` = reachable from the LAN (needs a password in `.env`); `127.0.0.1` = this machine only. |
 | `port` | Default `8000`. |
 | `[folders]` dxf / sat / pdf / step | Where the production files live. Prefer a UNC path (`\\server\share\...`) over a mapped drive (`K:`) if RevAudit runs at logon — drive letters only exist while you're signed in. |
-| `[folders]` report | Where reports are saved — the audit data as `.json`, rendered to HTML on demand (the CLI also writes the `.html` beside it) — so anyone with drive access can browse the audit history. Blank = keep them in the app folder. If the folder is unreachable when a report is written, that one falls back to the app folder. |
+| `[folders]` report | Where reports are saved — one `.html` per run with its data embedded, re-rendered by the web UI on every open — so anyone with drive access can browse the audit history. Blank = keep them in the app folder. If the folder is unreachable when a report is written, that one falls back to the app folder. |
 
 Every value also accepts an environment variable (`REVAUDIT_BIND_HOST`, `REVAUDIT_DXF_DIR`, …)
 and falls back to a built-in default, so an old `.env`-only setup keeps working untouched.
@@ -167,8 +167,8 @@ py -3.13 revaudit.py ASM-12345
 | `--export-step [DIR]` | Export each assembly's 3D geometry as STEP (see below). **On by default when `[folders] step` is configured**; `DIR` overrides the folder. |
 | `--no-export-step` | Skip the STEP export for this run. |
 | `--force-export` | Re-fetch PDFs/STEP files even when the file is already in the folder at the current revision. |
-| `-o, --output FILE` | Report path. The audit data is saved as `FILE`'s `.json` twin and the HTML rendered next to it. Without it, timestamped files go to `[folders] report` in `revaudit.conf`, or the app folder if that's unreachable or unset. |
-| `--render FILE.json` | Re-render the HTML from a saved report's data — no Onshape calls, no credentials needed. `-o` picks the output path. |
+| `-o, --output FILE` | Report path — one `.html` with the audit data embedded. Without it, a timestamped file goes to `[folders] report` in `revaudit.conf`, or the app folder if that's unreachable or unset. |
+| `--render FILE` | Re-render a saved report with the current layout from its embedded data — no Onshape calls, no credentials needed. Overwrites `FILE` unless `-o` is given. |
 | `--open` | Open the finished report in your browser. |
 | `--base-url URL` | Onshape URL, if not set in `.env`. |
 | `--company-id ID` | Skip company auto-detection. |
@@ -176,21 +176,33 @@ py -3.13 revaudit.py ASM-12345
 | `--no-deep` | Skip the extra element-type sweep on parts that appear to have no drawing. |
 | `-v` | Log every API call. |
 
-## Reports are stored as data, rendered on demand
+## One report file: the page, with its data inside
 
-A run saves its result as **JSON** — `revaudit-<timestamp>-<assemblies>-<token>.json` in the
-report folder (the CLI names its files `revaudit-<timestamp>_<assemblies>.json`) — and the HTML you look at is rendered from that file. The web UI renders it every
-time someone opens `/report/<id>`; the CLI writes the HTML next to the JSON and can
-regenerate it any time with `--render`. So the stored record is the audit itself (BOM
-lines, every part's current part/drawing revision, every finding, the Onshape links),
-not a frozen page: when the report layout improves, old audits pick it up on the next
-open, and the data can be read by anything that speaks JSON (`format: 1` in the file).
+A run saves one self-contained **`.html`** — `revaudit-<timestamp>-<assemblies>-<token>.html`
+in the report folder from the web UI, `revaudit-<timestamp>_<assemblies>.html` from the CLI.
+Double-click it anywhere and it's the report. But it also carries the audit data — BOM
+lines, every part's current part/drawing revision, every finding, the Onshape links — in a
+`<script type="application/json" id="revaudit-data">` block at the end, so it is the record
+too, not a frozen page:
 
-In the web UI the share bar has a **data (.json)** link beside the report link — same
-unguessable token, same no-password access. Reports made before this change were saved
-as finished HTML; they still open exactly as before, they just have no data twin.
+- the web UI re-renders it from that data every time someone opens `/report/<id>`, so when
+  the report layout improves, old audits pick it up on the next open;
+- `/report/<id>.json` returns just the data (same unguessable token, same no-password
+  access; the share bar has a **data (.json)** link);
+- `py -3.13 revaudit.py --render <file>` re-renders a saved report in place with the
+  current layout, offline, no credentials (`-o` to write elsewhere);
+- anything that speaks JSON can read it — cut the block out, or hit the `.json` URL
+  (`format: 1` in the data).
 
-Each stored report looks like:
+Why not a bare `.json`? It was, briefly — and it turned out to be *larger* than the HTML
+(the data keeps every part's status, the page only shows the findings) while no longer
+opening by double-click from the shared folder. One file that is both fixed that; the
+cost is ~140 KB per report instead of ~50 KB. Reports made before this change were saved
+as plain HTML without the block: they still open exactly as before, they just can't be
+re-rendered or read as data (`.json` gives 404 for them). Bare `.json` files from the
+interim are still read.
+
+The embedded data looks like:
 
 ```json
 {"app": "RevAudit", "format": 1, "generated": "2026-09-21 08:33",
@@ -329,7 +341,7 @@ the download link, so nobody has to remember this paragraph.
 
 | File | Purpose |
 |---|---|
-| `revaudit.py` | CLI entry point, report data (JSON) + HTML renderer |
+| `revaudit.py` | CLI entry point, report renderer (HTML with the audit data embedded) |
 | `serve.py` | Single-user web UI, API key from `.env` |
 | `oauth_app.py` | Multi-user web app, everyone signs in with their own Onshape account |
 | `import_key.py` | Imports credentials from a text file into `.env` |
