@@ -416,7 +416,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(form_page(values, f"{type(exc).__name__}: {exc}"))
 
         data = build_report(results, CONFIG["base_url"], folder_notes_for(values))
-        rid = new_report_id()
+        rid = new_report_id(names)
         saved = write_report(rid, data)
         session.setdefault("reports", []).append(rid)
         body = with_back_link(render_data(data), str(saved)).replace(

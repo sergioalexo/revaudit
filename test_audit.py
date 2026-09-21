@@ -13,7 +13,8 @@ from audit_core import audit_assembly
 from pdf_export import (_collect_jobs, export_assembly_drawings,
                         export_assembly_step_file, export_counts, safe_filename)
 from onshape_client import OnshapeError, normalize_bom, rev_lt
-from revaudit import build_report, load_report, render_data, save_report
+from revaudit import (build_report, load_report, render_data, report_name_part,
+                      save_report)
 
 # --------------------------------------------------------------------------
 # a mock Onshape backend shaped exactly like the real payloads
@@ -369,6 +370,38 @@ def main():
         check("existing STEP skipped", (step["skipped"], step["error"]), (True, None))
         step_forced = export_assembly_step_file(NoApiClient(), res, out, force=True)
         check("forced STEP hits the API", bool(step_forced["error"]), True)
+
+    print("\nreport names")
+    check("one assembly", report_name_part(["ASM-13417"]), "ASM-13417")
+    check("several joined with +", report_name_part(["ASM-1", "ASM-2", "ASM-3"]),
+          "ASM-1+ASM-2+ASM-3")
+    check("more than three summarised",
+          report_name_part(["ASM-1", "ASM-2", "ASM-3", "ASM-4", "ASM-5"]),
+          "ASM-1+ASM-2+ASM-3+2more")
+    check("filename-unsafe and '_' become '.'", report_name_part(["A/B_C:D"]), "A.B.C.D")
+    check("empty list", report_name_part([]), "audit")
+    import serve
+    shared_ok = ["revaudit-20260921-083310-ASM-13417-3lCz5WsDO8K1yQza",
+                 "revaudit-20260921-083310-ASM-1+ASM-2+2more-3lCz5WsDO8K1yQza.json",
+                 "revaudit-20260918-152706-G88H_djHZ-rV4psI.html"]      # pre-name format
+    check("shared names match", [bool(re.fullmatch(serve.SHARED_REPORT_RE, n))
+                                 for n in shared_ok], [True] * 3)
+    legacy_ok = ["revaudit-20260921-083310_ASM-13417.json", "revaudit-20260918-152706.html",
+                 "revaudit-20260921-083310_PRT-1234+PRT-5678+ASM-9"]
+    check("CLI names never pass as shared",
+          [bool(re.fullmatch(serve.SHARED_REPORT_RE, n)) for n in legacy_ok], [False] * 3)
+    check("CLI names are legacy (password-gated)",
+          [bool(re.fullmatch(serve.LEGACY_REPORT_RE, n)) for n in legacy_ok], [True] * 3)
+    check("new web id shape", bool(re.fullmatch(serve.SHARED_REPORT_RE,
+                                                serve.new_report_id(["ASM-13417"]))), True)
+    check("label shows assemblies + time",
+          serve.report_label("revaudit-20260921-083310-ASM-13417+ASM-12859-3lCz5WsDO8K1yQza.json"),
+          "ASM-13417 + ASM-12859 \u00b7 2026-09-21 08:33")
+    check("label for CLI name", serve.report_label("revaudit-20260921-083310_ASM-13417.html"),
+          "ASM-13417 \u00b7 2026-09-21 08:33")
+    check("label for old tokened name",
+          serve.report_label("revaudit-20260918-152706-G88H_djHZ-rV4psI.html"),
+          "2026-09-18 15:27")
 
     print("\naudit_assembly with a drifted workspace")
     res2 = audit_assembly(MockClient(drift=True), "CID", "ASM-TEST", [], workers=4,

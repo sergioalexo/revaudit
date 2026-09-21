@@ -38,7 +38,7 @@ from pdf_export import (export_assembly_drawings, export_assembly_step_file,
                         export_counts, safe_filename, zip_pdfs)
 import config
 from revaudit import (APP_NAME, CSS, build_report, credit_html, load_dotenv,
-                      load_report, render_data, save_report)
+                      load_report, render_data, report_name_part, save_report)
 
 HERE = Path(__file__).resolve().parent
 config.ensure_from_example()          # so `launch.bat` alone still works
@@ -47,27 +47,35 @@ DEFAULT_SAT_DIR = config.folder("sat")
 DEFAULT_PDF_DIR = config.folder("pdf")
 DEFAULT_STEP_DIR = config.folder("step")
 
-# A report is stored as revaudit-<timestamp>-<random token>.json - the audit
-# data only - and rendered to HTML whenever someone opens /report/<that id>.
-# The token is what makes a report link safe to hand out without also handing
-# out the site password: nobody can guess it, so holding the link is proof
-# enough that you were given it. The same id with .json appended returns the
-# raw data; with .html it serves a report saved before JSON storage existed
-# (those were written as finished HTML) or renders the JSON if there is none.
-SHARED_REPORT_RE = r"revaudit-\d{8}-\d{6}-[A-Za-z0-9_-]{10,}(?:\.json|\.html)?"
+# A report is stored as revaudit-<timestamp>-<assemblies>-<random token>.json
+# - the audit data only - and rendered to HTML whenever someone opens
+# /report/<that id>. The token (exactly 16 url-safe chars, always last) is
+# what makes a report link safe to hand out without also handing out the site
+# password: nobody can guess it, so holding the link is proof enough that you
+# were given it. The same id with .json appended returns the raw data; with
+# .html it serves a report saved before JSON storage existed (those were
+# written as finished HTML) or renders the JSON if there is none. Names from
+# before the assemblies were in them (revaudit-<timestamp>-<token>) still fit.
+TOKEN_CHARS = 16                                  # secrets.token_urlsafe(12)
+SHARED_REPORT_RE = (r"revaudit-\d{8}-\d{6}-(?:[A-Za-z0-9.+-]+-)?[A-Za-z0-9_-]{16}"
+                    r"(?:\.json|\.html)?")
 
-# revaudit-<timestamp> with no token - reports the CLI writes into the shared
-# folder, and web reports from before link sharing existed. They carry no
-# secret of their own, so they still need the site password rather than
-# being reachable by anyone who finds the filename.
-LEGACY_REPORT_RE = r"revaudit-\d{8}-\d{6}(?:\.json|\.html)?"
+# revaudit-<timestamp>[_<assemblies>] with no token - reports the CLI writes
+# into the shared folder, and web reports from before link sharing existed.
+# They carry no secret of their own, so they still need the site password
+# rather than being reachable by anyone who finds the filename. The '_' right
+# after the timestamp is what keeps a CLI name from ever looking like a
+# tokened one: a shared name always has '-' there.
+LEGACY_REPORT_RE = r"revaudit-\d{8}-\d{6}(?:_[A-Za-z0-9.+-]+)?(?:\.json|\.html)?"
 
 REPORT_EXTS = (".json", ".html")
 
 
-def new_report_id():
+def new_report_id(part_numbers=()):
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return f"revaudit-{stamp}-{secrets.token_urlsafe(12)}"
+    token = secrets.token_urlsafe(12)
+    assert len(token) == TOKEN_CHARS
+    return f"revaudit-{stamp}-{report_name_part(part_numbers)}-{token}"
 
 
 def report_id(name):
@@ -79,10 +87,17 @@ def report_id(name):
 
 
 def report_label(name):
-    """Short label for the 'recent reports' list - just the timestamp, not
-    the random token, which would be meaningless clutter to read."""
-    m = re.match(r"revaudit-(\d{8}-\d{6})", name)
-    return m.group(1) if m else name
+    """Short label for the 'recent reports' list: the assemblies and the
+    time, never the random token, which would be meaningless clutter."""
+    rid = report_id(name)
+    m = re.fullmatch(r"revaudit-(\d{8}-\d{6})(?:-(.+))?-[A-Za-z0-9_-]{16}", rid)
+    if not m:
+        m = re.fullmatch(r"revaudit-(\d{8}-\d{6})(?:_(.+))?", rid)
+    if not m:
+        return name
+    stamp, pns = m.group(1), m.group(2)
+    when = f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]} {stamp[9:11]}:{stamp[11:13]}"
+    return f"{pns.replace('+', ' + ')} \u00b7 {when}" if pns else when
 
 
 def report_dirs():
@@ -637,7 +652,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(form_page(values, f"{type(exc).__name__}: {exc}"))
 
         data = build_report(results, self.server.base_url, folder_notes_for(values))
-        rid = new_report_id()
+        rid = new_report_id(names)
         saved = write_report(rid, data)             # configured folder, or app folder
         body = with_back_link(render_data(data), str(saved), *self._share_urls(rid))
         self._send(body.encode("utf-8"))

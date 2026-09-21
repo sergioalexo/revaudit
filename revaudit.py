@@ -577,6 +577,22 @@ def load_report(path):
     return data
 
 
+def report_name_part(part_numbers, limit=3):
+    """The assembly numbers as a filename fragment: up to `limit` of them
+    joined with '+', then '+<n>more'. Anything a filename can't hold - or
+    that the report-name regexes treat as structure ('-' is fine, '_' is
+    not) - becomes '.'."""
+    clean = [re.sub(r"[^A-Za-z0-9.\-]+", ".", str(pn)).strip(".") or "x"
+             for pn in part_numbers]
+    clean = [c[:24] for c in clean if c]
+    if not clean:
+        return "audit"
+    shown = "+".join(clean[:limit])
+    if len(clean) > limit:
+        shown += f"+{len(clean) - limit}more"
+    return shown
+
+
 def render_report(results, base_url, folder_notes=None, generated=None):
     """Render straight from audit results - build_report + render_data."""
     return render_data(build_report(results, base_url, folder_notes, generated))
@@ -977,7 +993,10 @@ def main(argv=None):
     # HTML beside it is the same report rendered for reading now.
     data = build_report(results, base_url, folder_notes)
     report_html = render_data(data)
-    stamp = "revaudit-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    # revaudit-<stamp>_<assemblies>: the '_' after the stamp is what tells the
+    # web UI this is a CLI file with no share token in its name (see serve.py).
+    stamp = ("revaudit-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+             + "_" + report_name_part(args.assemblies))
     if args.output:
         out_path = Path(args.output).with_suffix(".html")
     else:

@@ -178,8 +178,8 @@ py -3.13 revaudit.py ASM-12345
 
 ## Reports are stored as data, rendered on demand
 
-A run saves its result as **JSON** — `revaudit-<timestamp>-<token>.json` in the report
-folder — and the HTML you look at is rendered from that file. The web UI renders it every
+A run saves its result as **JSON** — `revaudit-<timestamp>-<assemblies>-<token>.json` in the
+report folder (the CLI names its files `revaudit-<timestamp>_<assemblies>.json`) — and the HTML you look at is rendered from that file. The web UI renders it every
 time someone opens `/report/<id>`; the CLI writes the HTML next to the JSON and can
 regenerate it any time with `--render`. So the stored record is the audit itself (BOM
 lines, every part's current part/drawing revision, every finding, the Onshape links),
