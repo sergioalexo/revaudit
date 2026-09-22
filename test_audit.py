@@ -7,12 +7,13 @@ import json
 import re
 import sys
 import tempfile
+from html import unescape
 from pathlib import Path
 
 from audit_core import audit_assembly
 from pdf_export import (_collect_jobs, export_assembly_drawings,
                         export_assembly_step_file, export_counts, safe_filename)
-from onshape_client import OnshapeError, normalize_bom, rev_lt
+from onshape_client import OnshapeClient, OnshapeError, normalize_bom, rev_lt
 from revaudit import (build_report, extract_data, load_report, render_data,
                       report_name_part, save_report)
 
@@ -119,6 +120,9 @@ class MockClient:
         return [{"revision": r, "isObsolete": i > 0, "documentName": "SRC",
                  "viewRef": f"https://cad.example/documents/D/v/V-{pn}-{r}/e/P-{pn}"}
                 for i, r in enumerate(revs)]
+
+    def forget_revisions(self):
+        pass                       # nothing is remembered here to forget
 
     def document(self, did):
         return {"defaultWorkspace": {"id": "W"}}
@@ -424,6 +428,133 @@ def main():
     check("label for old tokened name",
           serve.report_label("revaudit-20260918-152706-G88H_djHZ-rV4psI.html"),
           "2026-09-18 15:27")
+
+    print("\nrevision lookups are remembered instead of re-asked")
+
+    class CountingClient(OnshapeClient):
+        """A real client with the network taken out, so the memo around
+        revisions() is what is actually under test."""
+
+        def __init__(self, **kw):
+            super().__init__("https://cad.example", "a", "b", **kw)
+            self.gets = 0
+
+        def get(self, path, params=None, retries=4):
+            self.gets += 1
+            return {"items": [{"revision": "A", "isObsolete": False}]}
+
+    memo = CountingClient(revision_cache_seconds=600)
+    memo.revisions("CID", "PRT-1", 0)
+    memo.revisions("CID", "PRT-1", 0)
+    memo.revisions("CID", "PRT-1", 2)        # different element type -> its own entry
+    memo.revisions("CID", "PRT-2", 0)
+    check("repeat lookup costs no call", memo.gets, 3)
+    check("repeats are counted", memo.cached_count, 1)
+    memo.revisions("CID", "PRT-1", 0)[0]["revision"] = "MUTATED"
+    check("callers cannot corrupt the memo",
+          memo.revisions("CID", "PRT-1", 0)[0]["revision"], "A")
+    memo.forget_revisions()
+    memo.revisions("CID", "PRT-1", 0)
+    check("forget_revisions re-asks", memo.gets, 4)
+    off = CountingClient(revision_cache_seconds=0)
+    off.revisions("CID", "PRT-1", 0)
+    off.revisions("CID", "PRT-1", 0)
+    check("0 seconds turns it off", off.gets, 2)
+
+    print("\nalready-audited check")
+    import serve
+
+    check("id carries its assemblies",
+          serve.report_pn_parts("revaudit-20260921-083310-ASM-1+ASM-2-3lCz5WsDO8K1yQza"),
+          (["ASM-1", "ASM-2"], False))
+    check("'+2more' means some were left out",
+          serve.report_pn_parts("revaudit-20260921-083310-ASM-1+2more-3lCz5WsDO8K1yQza"),
+          (["ASM-1"], True))
+    check("a nameless id could cover anything",
+          serve.report_pn_parts("revaudit-20260918-152706-G88H_djHZ-rV4psI"),
+          ([], True))
+    check("CLI name carries its assemblies",
+          serve.report_pn_parts("revaudit-20260921-083310_ASM-13417"),
+          (["ASM-13417"], False))
+    check("named report only matches its own",
+          [serve.report_may_cover("revaudit-20260921-083310-ASM-1-3lCz5WsDO8K1yQza", f)
+           for f in ("ASM-1", "ASM-2")], [True, False])
+    check("truncated report is always a candidate",
+          serve.report_may_cover("revaudit-20260921-083310-ASM-1+2more-3lCz5WsDO8K1yQza",
+                                 "ASM-9"), True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        reports = Path(tmp)
+        original_dirs = serve.report_dirs
+        serve.report_dirs = lambda: [reports]
+        try:
+            rid = serve.new_report_id(["ASM-TEST"])
+            save_report(reports / f"{rid}.html",
+                        build_report([res], "https://cad.example"))
+
+            coverage = serve.report_coverage(reports / f"{rid}.html")
+            check("coverage names the audited revision",
+                  coverage["ASM-TEST"]["revision"], "A")
+            check("coverage lists the file checks it ran",
+                  sorted(coverage["ASM-TEST"]["checks"]), ["DXF", "SAT"])
+
+            hit = serve.find_prior_report("ASM-TEST", "A")
+            check("finds the report for this revision", hit and hit["id"], rid)
+            check("a different revision is not covered",
+                  serve.find_prior_report("ASM-TEST", "B"), None)
+            check("another assembly is not covered",
+                  serve.find_prior_report("ASM-OTHER", "A"), None)
+            check("no revision -> no shortcut",
+                  serve.find_prior_report("ASM-TEST", None), None)
+            check("a report the user may not open is not offered",
+                  serve.find_prior_report("ASM-TEST", "A", allowed_ids=[]), None)
+            check("their own report is offered",
+                  bool(serve.find_prior_report("ASM-TEST", "A", allowed_ids=[rid])), True)
+
+            # an assembly that never resolved covers nothing - re-running it
+            # is the only way to get an answer
+            failed_id = serve.new_report_id(["ASM-NOPE"])
+            save_report(reports / f"{failed_id}.html", build_report(
+                [{"partNumber": "ASM-NOPE", "errors": ["nope"], "findings": {}}],
+                "https://cad.example"))
+            check("a failed audit covers nothing",
+                  serve.find_prior_report("ASM-NOPE", "A"), None)
+
+            print("\nthe run/re-run prompt")
+            asm_client = MockClient()
+            entries = serve.prior_runs(asm_client, "CID", ["ASM-TEST", "ASM-NOPE"])
+            check("one revision lookup per assembly", asm_client.call_count, 2)
+            check("covered assembly is matched to its report",
+                  entries[0]["prior"]["id"], rid)
+            check("uncovered assembly has no prior", entries[1]["prior"], None)
+
+            values = serve.parse_run_form({
+                "assemblies": ["ASM-TEST ASM-NOPE"], "dxf_dir": ["DXFDIR"],
+                "dxf_recursive": ["on"], "export_drawings": ["on"],
+                "pdf_dir": ["PDFDIR"],
+            })
+            prompt = serve.already_run_page(values, entries).decode("utf-8")
+            check("prompt offers the existing report", f"/report/{rid}" in prompt, True)
+            check("prompt offers a re-run", "Run the audit again" in prompt, True)
+            check("prompt offers just the uncovered one",
+                  "Audit only the\n            1 not yet covered" in prompt, True)
+            check("prompt says what the old report is missing",
+                  "This run would add: drawing PDFs." in prompt, True)
+            check("prompt names the revision", "Rev A" in prompt, True)
+
+            # the prompt's buttons must re-post the same audit, unchanged
+            hidden = dict(re.findall(
+                r"<input type='hidden' name='([^']+)' value='([^']*)'>",
+                serve.hidden_fields_html(values, force_run="1")))
+            reposted = serve.parse_run_form(
+                {k: [unescape(v)] for k, v in hidden.items()})
+            check("re-post keeps every setting",
+                  {k: reposted[k] for k in values if k != "force_run"},
+                  {k: v for k, v in values.items() if k != "force_run"})
+            check("re-post is forced", reposted["force_run"], True)
+            check("the plain form is not forced", values["force_run"], False)
+        finally:
+            serve.report_dirs = original_dirs
 
     print("\naudit_assembly with a drifted workspace")
     res2 = audit_assembly(MockClient(drift=True), "CID", "ASM-TEST", [], workers=4,

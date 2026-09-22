@@ -33,7 +33,8 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 from audit_core import FileIndex, audit_assembly
-from onshape_client import DEFAULT_BASE_URL, OnshapeClient, OnshapeError
+from onshape_client import (DEFAULT_BASE_URL, ET_ASSEMBLY, OnshapeClient,
+                            OnshapeError, current_revision)
 from pdf_export import (export_assembly_drawings, export_assembly_step_file,
                         export_counts, safe_filename, zip_pdfs)
 import config
@@ -302,6 +303,179 @@ def handle_index_upload(handler):
 
 
 # --------------------------------------------------------------------------
+# "this was already audited" check
+# --------------------------------------------------------------------------
+#
+# An audit is hundreds of Onshape calls - one per part, more for the parts
+# with no drawing - and it is usually asked for again long before anything
+# it looks at has moved. So before running, RevAudit asks one question
+# ("what revision is this assembly at?") and looks for a report that already
+# covers that exact revision. If it finds one, it offers that report instead
+# of spending the calls, and the person decides which they want.
+
+def report_pn_parts(rid):
+    """(the assembly numbers written into a report id, whether any were left
+    out of the name). A report name holds at most three, then '+<n>more' -
+    and a report from before names carried assemblies holds none at all,
+    which counts as "left out": such a report might cover anything."""
+    m = re.fullmatch(r"revaudit-\d{8}-\d{6}(?:-(.+))?-[A-Za-z0-9_-]{16}", rid)
+    if not m:
+        m = re.fullmatch(r"revaudit-\d{8}-\d{6}(?:_(.+))?", rid)
+    if not m or not m.group(1):
+        return [], True
+    parts = m.group(1).split("+")
+    truncated = bool(re.fullmatch(r"\d+more", parts[-1]))
+    return (parts[:-1] if truncated else parts), truncated
+
+
+def report_may_cover(rid, fragment):
+    """Could this report hold an audit of `fragment` (a part number as
+    report_name_part writes it)? A filename test only - cheap enough to run
+    over a whole folder, and it is what keeps the real check down to a
+    handful of files instead of every report ever written."""
+    parts, truncated = report_pn_parts(rid)
+    return truncated or fragment in parts
+
+
+def result_checks(result):
+    """The optional extras one audited assembly in a saved report came with -
+    'DXF', 'SAT', 'drawing PDFs', 'STEP' - so a previous report can say what
+    it did and did not cover."""
+    names = list((result.get("findings") or {}).get("files") or {})
+    if result.get("drawingExport"):
+        names.append("drawing PDFs")
+    if result.get("stepExport"):
+        names.append("STEP")
+    return names
+
+
+# Reports live on a share and carry their whole data block, so each one is
+# parsed once and kept by (mtime, size) - a saved report is never edited in
+# place, so that pair changing means it really is a different file.
+_coverage_cache = {}
+_COVERAGE_CACHE_MAX = 500
+
+
+def report_coverage(path):
+    """{assembly part number: {"revision", "generated", "checks"}} for one
+    saved report. An assembly that never resolved is left out - nothing was
+    audited, so nothing is covered. An unreadable file gives {}."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return {}
+    stamp = (stat.st_mtime, stat.st_size)
+    hit = _coverage_cache.get(str(path))
+    if hit and hit[0] == stamp:
+        return hit[1]
+    try:
+        data = load_report(path)
+    except (OSError, ValueError):          # unreadable, or not a report at all
+        data = None
+    coverage = {}
+    for result in (data or {}).get("results") or []:
+        pn = result.get("partNumber")
+        revision = (result.get("assembly") or {}).get("revision")
+        if not pn or not revision:
+            continue
+        coverage[str(pn)] = {
+            "revision": str(revision),
+            "generated": (data or {}).get("generated") or "",
+            "checks": result_checks(result),
+        }
+    if len(_coverage_cache) > _COVERAGE_CACHE_MAX:
+        _coverage_cache.clear()
+    _coverage_cache[str(path)] = (stamp, coverage)
+    return coverage
+
+
+def _mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def find_prior_report(part_number, revision, allowed_ids=None, scan_limit=40):
+    """The newest saved report that already audited this assembly at exactly
+    this revision - {"id", "label", "path", "revision", "generated",
+    "checks"} - or None.
+
+    allowed_ids, when given, restricts the search to those report ids: the
+    OAuth app only ever shows someone their own reports, so it must not
+    offer one it would then refuse to open.
+    """
+    if not revision:
+        return None
+    fragment = report_name_part([part_number])
+    allowed = None if allowed_ids is None else set(allowed_ids)
+    newest = {}
+    for d in report_dirs():
+        for ext in REPORT_EXTS:
+            try:
+                candidates = list(d.glob(f"revaudit-*{ext}"))
+            except OSError:
+                continue
+            for path in candidates:
+                rid = report_id(path.name)
+                if allowed is not None and rid not in allowed:
+                    continue
+                if not report_may_cover(rid, fragment):
+                    continue
+                if rid not in newest or _mtime(path) > _mtime(newest[rid]):
+                    newest[rid] = path
+    for path in sorted(newest.values(), key=_mtime, reverse=True)[:scan_limit]:
+        entry = report_coverage(path).get(str(part_number))
+        if entry and entry["revision"] == str(revision):
+            return {"id": report_id(path.name), "label": report_label(path.name),
+                    "path": str(path), **entry}
+    return None
+
+
+def current_assembly_revision(client, company_id, part_number):
+    """The revision an audit would report on, from the single revision
+    lookup that audit starts with anyway - the client remembers it, so
+    asking here and then running costs no extra call."""
+    revs = client.revisions(company_id, part_number, ET_ASSEMBLY)
+    if not revs:
+        return None
+    return (current_revision(revs) or revs[0]).get("revision")
+
+
+def prior_runs(client, company_id, names, allowed_ids=None):
+    """One entry per assembly: {"name", "revision", "prior", "error"}. Costs
+    a single (memoised) revision lookup each - no BOM, no per-part sweep."""
+    entries = []
+    for name in names:
+        try:
+            revision = current_assembly_revision(client, company_id, name)
+        except OnshapeError as exc:
+            # the shortcut check must never be what stops a requested run
+            entries.append({"name": name, "revision": None, "prior": None,
+                            "error": str(exc)})
+            continue
+        entries.append({
+            "name": name,
+            "revision": revision,
+            "prior": find_prior_report(name, revision, allowed_ids),
+            "error": None,
+        })
+    return entries
+
+
+def requested_checks(values):
+    """The extras this submitted form asks for, named the way result_checks()
+    names them, so what a previous report covered can be compared with what
+    is being asked for now."""
+    names = [c["name"] for c in FILE_CHECK_DEFS if values.get(c["field"] + "_dir")]
+    if values.get("export_drawings") and values.get("pdf_dir"):
+        names.append("drawing PDFs")
+    if values.get("export_step") and values.get("step_dir"):
+        names.append("STEP")
+    return names
+
+
+# --------------------------------------------------------------------------
 # pages
 # --------------------------------------------------------------------------
 
@@ -331,7 +505,8 @@ def page(title, body):
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        f"<title>{html.escape(title)}</title><style>{CSS}{FORM_CSS}</style></head>"
+        f"<title>{html.escape(title)}</title>"
+        f"<style>{CSS}{FORM_CSS}{ALREADY_CSS}</style></head>"
         f"<body><div class='wrap'>{body}</div></body></html>"
     ).encode("utf-8")
 
@@ -463,6 +638,121 @@ def form_page(values=None, error=None, report_names=None):
         document.getElementById('spin').classList.add('on');
       }}
       </script>
+    """)
+
+
+ALREADY_CSS = """
+.prior{border:1px solid var(--line);border-radius:8px;background:var(--panel);
+  padding:13px 16px;margin:12px 0}
+.prior .pn{font-weight:600;font-size:15px}
+.prior .line{color:var(--muted);font-size:13px;margin:3px 0 0}
+.prior .line b{color:var(--fg);font-weight:600}
+.prior a.open{display:inline-block;margin-top:9px;color:var(--accent);
+  text-decoration:none;font-weight:600;font-size:13.5px}
+.prior a.open:hover{text-decoration:underline}
+.prior .gap{color:var(--warn);font-size:13px;margin:7px 0 0}
+.prior.fresh{background:transparent}
+.choices{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:8px}
+.choices form{margin:0}
+.choices button{margin:0}
+.choices button.second{background:var(--panel2);color:var(--fg);
+  border:1px solid var(--line)}
+.choices .back{color:var(--accent);text-decoration:none;font-size:13.5px}
+"""
+
+
+def hidden_fields_html(values, **overrides):
+    """The whole /run form as hidden inputs, so a follow-up page can re-post
+    the same audit - same folders, same checks, same export choices - without
+    anyone having to fill the form in again. Booleans become the "1" a
+    checkbox posts; blanks are dropped, which is exactly how a blank folder
+    reads as "skip that check"."""
+    fields = {**values, **overrides}
+    out = []
+    for key, value in fields.items():
+        if value is True:
+            value = "1"
+        if value is False or value is None or value == "":
+            continue
+        out.append(f"<input type='hidden' name='{html.escape(str(key))}' "
+                   f"value='{html.escape(str(value))}'>")
+    return "".join(out)
+
+
+def already_run_page(values, entries):
+    """The page shown when an assembly is already covered by a report at its
+    current revision: what was found, and the choice between opening it and
+    spending the API calls again.
+
+    entries is what prior_runs() returned. At least one of them has a prior
+    report - otherwise the audit would just have run.
+    """
+    covered = [e for e in entries if e["prior"]]
+    pending = [e for e in entries if not e["prior"]]
+    wanted = requested_checks(values)
+
+    cards = []
+    for entry in covered:
+        prior = entry["prior"]
+        checks = prior["checks"]
+        covered_note = (f" &middot; covered {html.escape(', '.join(checks))}"
+                        if checks else "")
+        gap = [c for c in wanted if c not in checks]
+        gap_note = (f"<p class='gap'>This run would add: "
+                    f"{html.escape(', '.join(gap))}.</p>" if gap else "")
+        cards.append(f"""
+        <div class='prior'>
+          <div class='pn'>{html.escape(entry["name"])} &middot;
+            Rev {html.escape(str(entry["revision"]))}</div>
+          <p class='line'>Report from
+            <b>{html.escape(prior["generated"] or "an earlier run")}</b>{covered_note}</p>
+          {gap_note}
+          <a class='open' href='/report/{html.escape(prior["id"])}'>
+            Open that report &rarr;</a>
+        </div>""")
+
+    for entry in pending:
+        if entry["error"]:
+            note = html.escape(entry["error"])
+        elif not entry["revision"]:
+            note = "No released revision found - the audit will say why."
+        else:
+            note = f"Rev {html.escape(str(entry['revision']))} &middot; not audited yet"
+        cards.append(
+            f"<div class='prior fresh'><div class='pn'>{html.escape(entry['name'])}"
+            f"</div><p class='line'>{note}</p></div>")
+
+    pending_names = " ".join(e["name"] for e in pending)
+    only_new = ""
+    if pending:
+        only_new = f"""
+        <form method='post' action='/run'>
+          {hidden_fields_html(values, assemblies=pending_names, force_run="1")}
+          <button type='submit' class='second'>Audit only the
+            {len(pending)} not yet covered</button>
+        </form>"""
+
+    return page(f"{APP_NAME} - already audited", f"""
+      <h1>{APP_NAME}</h1>
+      <p class='sub'>Already audited at this revision.</p>
+      <p>Nothing was requested from Onshape yet beyond each assembly's current
+      revision. A full audit is hundreds of API calls, so here is what already
+      exists:</p>
+      {"".join(cards)}
+      <p style='color:var(--muted);font-size:13px;margin:18px 0 6px'>
+      The assembly is still at the revision that report was written for. Its
+      parts can have moved since though &mdash; a drawing released, a DXF
+      dropped in the folder &mdash; so run it again if you need today's answer
+      rather than that one.</p>
+      <div class='choices'>
+        <form method='post' action='/run'>
+          {hidden_fields_html(values, force_run="1")}
+          <button type='submit'>Run the audit again</button>
+        </form>
+        {only_new}
+        <a class='back' href='/'>&larr; Change the settings</a>
+      </div>
+      <footer>{credit_html()}</footer>
     """)
 
 
@@ -647,6 +937,20 @@ class Handler(BaseHTTPRequestHandler):
         # LAN IP - computed up front since the drawing export needs it too.
         host = self.headers.get("Host", f"localhost:{self.server.server_port}")
 
+        client = SERVER_STATE["client"]
+        company_id = SERVER_STATE["company_id"]
+        if values.get("force_run"):
+            # an explicit re-run is the one place certainty matters more than
+            # the saved calls, so nothing remembered is reused
+            client.forget_revisions()
+        else:
+            try:
+                entries = prior_runs(client, company_id, names)
+            except OnshapeError as exc:
+                return self._send(form_page(values, str(exc)))
+            if any(e["prior"] for e in entries):
+                return self._send(already_run_page(values, entries))
+
         try:
             with _run_lock:          # one audit at a time keeps API load predictable
                 results = run_audit(names, values)
@@ -674,6 +978,8 @@ def parse_run_form(fields):
         "export_step": bool(fields.get("export_step")),
         "step_dir": (fields.get("step_dir", [""])[0]).strip(),
         "force_export": bool(fields.get("force_export")),
+        # set by the "already audited" page's buttons - run it regardless
+        "force_run": bool(fields.get("force_run")),
     }
     for check in FILE_CHECK_DEFS:
         field = check["field"]
@@ -896,7 +1202,8 @@ def _main(argv):
         return 2
 
     base_url = os.environ.get("ONSHAPE_BASE_URL") or DEFAULT_BASE_URL
-    client = OnshapeClient(base_url, access, secret)
+    client = OnshapeClient(base_url, access, secret,
+                           revision_cache_seconds=config.revision_cache_seconds())
     company_id = os.environ.get("ONSHAPE_COMPANY_ID")
     if not company_id:
         companies = client.companies()

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -30,9 +32,13 @@ class OnshapeClient:
     """Onshape REST client using API-key basic auth."""
 
     def __init__(self, base_url, access_key=None, secret_key=None, timeout=60,
-                 verbose=False, bearer_token=None):
+                 verbose=False, bearer_token=None, revision_cache_seconds=600):
         """Authenticate with an API key (access_key + secret_key) or, for the
-        OAuth flow, with a per-user bearer token."""
+        OAuth flow, with a per-user bearer token.
+
+        revision_cache_seconds is how long a revision lookup is reused - see
+        revisions(). 0 turns the reuse off.
+        """
         self.base = base_url.rstrip("/")
         if bearer_token:
             self.auth = "Bearer " + bearer_token
@@ -44,6 +50,10 @@ class OnshapeClient:
         self.timeout = timeout
         self.verbose = verbose
         self.call_count = 0
+        self.cached_count = 0                     # lookups answered from memory
+        self.revision_cache_seconds = revision_cache_seconds
+        self._rev_cache = {}
+        self._rev_lock = threading.Lock()
 
     def set_bearer(self, bearer_token):
         """Swap in a freshly refreshed OAuth token."""
@@ -167,12 +177,46 @@ class OnshapeClient:
         return data.get("items", []) or []
 
     def revisions(self, company_id, part_number, element_type):
+        """Every revision of a part number, newest first.
+
+        Memoised for revision_cache_seconds. One audit asks for the same part
+        number several times over (the assembly probe, then the audit itself,
+        then the no-drawing sweep), and assemblies sharing parts ask again per
+        assembly - while a released revision, once it exists, never changes.
+        Only "a revision released in the last few minutes" can be missed, and
+        the TTL bounds that; forget_revisions() drops the lot when a caller
+        wants certainty.
+        """
+        key = (str(company_id), str(part_number), element_type)
+        ttl = self.revision_cache_seconds
+        now = time.time()
+        if ttl:
+            with self._rev_lock:
+                hit = self._rev_cache.get(key)
+            if hit and now - hit[0] < ttl:
+                self.cached_count += 1
+                if self.verbose:
+                    print(f"      cached revisions {part_number} et={element_type}",
+                          file=sys.stderr)
+                # a copy: six worker threads share this entry, and a caller
+                # that edited one would silently rewrite everyone else's
+                return copy.deepcopy(hit[1])
         pn = urllib.parse.quote(str(part_number), safe="")
         data = self.get(
             f"/api/v6/revisions/companies/{company_id}/partnumber/{pn}",
             {"elementType": element_type},
         )
-        return (data or {}).get("items", []) or []
+        items = (data or {}).get("items", []) or []
+        if ttl:
+            with self._rev_lock:
+                self._rev_cache[key] = (now, copy.deepcopy(items))
+        return items
+
+    def forget_revisions(self):
+        """Drop every memoised revision lookup, so the next audit re-reads
+        them from Onshape. Used when someone explicitly asks for a re-run."""
+        with self._rev_lock:
+            self._rev_cache.clear()
 
     def document(self, did):
         return self.get(f"/api/v6/documents/{did}")

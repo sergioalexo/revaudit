@@ -53,3 +53,19 @@ step =
 #
 # Example: report = \\server\share\RevAudit Reports
 report =
+
+
+[audit]
+
+# RevAudit answers every question it asks Onshape with a "revisions of this
+# part number" lookup, and the same part number comes up again and again -
+# within one audit, and across assemblies that share parts. Each lookup is
+# remembered for this many seconds instead of being asked twice.
+#
+# A revision never changes once it has been released, so the only thing this
+# can miss is a release made in the last few minutes. Pressing "Run the audit
+# again" in the web form always clears the memory first and re-reads
+# everything, so there is a way to be certain.
+#
+# 600 = ten minutes. Set it to 0 to ask Onshape every single time.
+revision_cache_seconds = 600

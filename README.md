@@ -121,6 +121,7 @@ Plain text, safe to read, opens in Notepad. Restart RevAudit after editing.
 | `port` | Default `8000`. |
 | `[folders]` dxf / sat / pdf / step | Where the production files live. Prefer a UNC path (`\\server\share\...`) over a mapped drive (`K:`) if RevAudit runs at logon — drive letters only exist while you're signed in. |
 | `[folders]` report | Where reports are saved — one `.html` per run with its data embedded, re-rendered by the web UI on every open — so anyone with drive access can browse the audit history. Blank = keep them in the app folder. If the folder is unreachable when a report is written, that one falls back to the app folder. |
+| `[audit]` revision_cache_seconds | How long a revision lookup is reused before Onshape is asked again. Default `600` (ten minutes); `0` asks every time. See [Not burning API calls](#not-burning-api-calls). |
 
 Every value also accepts an environment variable (`REVAUDIT_BIND_HOST`, `REVAUDIT_DXF_DIR`, …)
 and falls back to a built-in default, so an old `.env`-only setup keeps working untouched.
@@ -175,6 +176,45 @@ py -3.13 revaudit.py ASM-12345
 | `--workers N` | Parallel API lookups, default 6. Lower it if you hit rate limits. |
 | `--no-deep` | Skip the extra element-type sweep on parts that appear to have no drawing. |
 | `-v` | Log every API call. |
+
+## Not burning API calls
+
+An audit is hundreds of Onshape calls — roughly `2 + 2 × (unique parts)`, more for parts
+that appear to have no drawing — and most of the time it is asked for again long before
+anything it looks at has moved. Two things keep that in check.
+
+**Every repeated lookup is answered from memory.** Each check this tool runs is a
+"revisions of this part number" lookup, and the same part number comes up several times
+within one audit and again for every assembly that shares it. Each one is remembered for
+`[audit] revision_cache_seconds` (default ten minutes) instead of being asked twice. A
+released revision never changes once it exists, so the only thing this can miss is a
+release made in the last few minutes.
+
+**A run that would repeat an existing report offers that report instead.** Before running,
+the web UI asks one question — *what revision is this assembly at?* — and looks for a
+saved report that already covers that exact revision. If it finds one, nothing else is
+requested from Onshape and you get the choice:
+
+- **Open that report** — the one already on the share, at this revision.
+- **Run the audit again** — spends the calls, and clears the remembered lookups first so
+  everything is re-read from Onshape.
+- **Audit only the N not yet covered** — when some of the assemblies you typed are
+  already covered and some aren't.
+
+The card for each assembly says when the existing report was written and which checks it
+covered (`DXF`, `SAT`, drawing PDFs, STEP), and flags anything this run would add that the
+old report doesn't have.
+
+Why it asks rather than just reusing the report: the assembly sitting at the same revision
+doesn't mean nothing under it moved. A part drawing can be released, a DXF dropped into the
+folder. The old report is right about the assembly's own release state and probably right
+about everything else — but "probably" is your call to make, not the tool's.
+
+Only reports you can open are ever offered. In OAuth mode that means your own, never
+another user's — they may cover documents you cannot see.
+
+The CLI does not prompt (it has to stay scriptable), but it uses the same memory, and
+prints how many lookups it answered from it alongside the API call count.
 
 ## One report file: the page, with its data inside
 
@@ -370,7 +410,8 @@ py -3.13 test_audit.py
 - An assembly that has never been released won't be found, since the lookup goes through
   the revision registry. The tool says so rather than failing silently.
 - API calls per assembly are roughly `2 + 2 × (unique parts)`, so ~150 for a 70-part
-  assembly. Retries with backoff are built in for 429 and 5xx responses.
+  assembly — before the savings in [Not burning API calls](#not-burning-api-calls).
+  Retries with backoff are built in for 429 and 5xx responses.
 
 
 ## Access modes

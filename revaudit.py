@@ -916,7 +916,8 @@ def main(argv=None):
         return 2
 
     base_url = args.base_url or os.environ.get("ONSHAPE_BASE_URL") or DEFAULT_BASE_URL
-    client = OnshapeClient(base_url, access, secret, verbose=args.verbose)
+    client = OnshapeClient(base_url, access, secret, verbose=args.verbose,
+                           revision_cache_seconds=config.revision_cache_seconds())
 
     try:
         company_id = args.company_id or os.environ.get("ONSHAPE_COMPANY_ID")
@@ -1017,7 +1018,9 @@ def main(argv=None):
         print("\nInterrupted.", file=sys.stderr)
         return 130
 
-    print(f"\n{client.call_count} API calls\n")
+    reused = client.cached_count
+    print(f"\n{client.call_count} API calls"
+          + (f", {reused} repeat lookups answered from memory" if reused else "") + "\n")
     print("Results")
     print("-" * 60)
     for result in results:

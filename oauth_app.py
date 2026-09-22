@@ -50,14 +50,15 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import config
 from audit_core import audit_assembly
 from onshape_client import DEFAULT_BASE_URL, OnshapeClient, OnshapeError
 from revaudit import (APP_NAME, CSS, build_report, credit_html, data_json,
                       load_dotenv, load_report, render_data)
-from serve import (FORM_CSS, build_file_checks, find_report, folder_notes_for,
-                   form_page, handle_index_upload, new_report_id, page,
-                   parse_run_form, report_id, run_exports, with_back_link,
-                   write_report)
+from serve import (FORM_CSS, already_run_page, build_file_checks, find_report,
+                   folder_notes_for, form_page, handle_index_upload,
+                   new_report_id, page, parse_run_form, prior_runs, report_id,
+                   run_exports, with_back_link, write_report)
 
 HERE = Path(__file__).resolve().parent
 
@@ -136,7 +137,19 @@ def valid_token(session):
 
 
 def client_for(session):
-    client = OnshapeClient(CONFIG["base_url"], bearer_token=valid_token(session))
+    """One client per signed-in session, kept across requests so the revision
+    lookups it remembers are still there for this person's next audit - which
+    is what makes the "already audited?" check free. A refreshed token is
+    swapped into the same client rather than building a new one, which would
+    throw that memory away."""
+    token = valid_token(session)
+    client = session.get("client")
+    if client is None:
+        client = session["client"] = OnshapeClient(
+            CONFIG["base_url"], bearer_token=token,
+            revision_cache_seconds=config.revision_cache_seconds())
+    else:
+        client.set_bearer(token)
     return client
 
 
@@ -398,6 +411,20 @@ class Handler(BaseHTTPRequestHandler):
                         "No Onshape company is associated with this account.")
                 company_id = session["company_id"] = companies[0]["id"]
 
+            # Before spending the calls: is one of this person's own reports
+            # already the answer? Only their own - a report they cannot open
+            # would be a dead link, and it may cover documents they cannot
+            # see. One memoised revision lookup per assembly.
+            if values.get("force_run"):
+                client.forget_revisions()
+            else:
+                entries = prior_runs(client, company_id, names,
+                                     session.get("reports", []))
+                if any(e["prior"] for e in entries):
+                    body = already_run_page(values, entries).decode("utf-8")
+                    return self._send(body.replace(
+                        "<h1>", header_for(session) + "<h1>", 1).encode("utf-8"))
+
             file_checks = build_file_checks(values)
             results = []
             for name in names:
@@ -429,7 +456,6 @@ class Handler(BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------
 
 def main(argv=None):
-    import config
     parser = argparse.ArgumentParser(description="RevAudit with Onshape OAuth")
     parser.add_argument("--port", type=int, default=None, help="overrides revaudit.conf")
     parser.add_argument("--host", default=None, help="overrides revaudit.conf")

@@ -86,6 +86,18 @@ def port():
         return 8000
 
 
+def revision_cache_seconds():
+    """How long a revision lookup is reused before Onshape is asked again.
+    Every check this tool runs is a revision lookup, and the same part number
+    comes up repeatedly within a run and across assemblies, so reuse is where
+    most of the API traffic is saved. 0 turns it off."""
+    raw = get("audit", "revision_cache_seconds", "REVAUDIT_REVISION_CACHE_SECONDS", "600")
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 600
+
+
 def advertised_address():
     """The address to show people in the startup banner. None = auto-detect
     and list every candidate, so a changed DHCP lease is obvious."""
