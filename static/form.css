@@ -1,0 +1,18 @@
+.form{max-width:640px}
+label{display:block;margin:18px 0 6px;font-weight:600;font-size:14px}
+.hint{color:var(--muted);font-weight:400;font-size:12.5px;margin-top:3px}
+input[type=text]{width:100%;padding:10px 12px;border-radius:7px;
+  border:1px solid var(--line);background:var(--panel);color:var(--fg);font-size:14px;
+  font-family:inherit}
+input[type=text]:focus{outline:2px solid var(--accent);outline-offset:1px}
+.row{display:flex;align-items:center;gap:9px;margin:16px 0}
+.row label{margin:0;font-weight:400}
+button{margin-top:26px;padding:12px 26px;border-radius:7px;border:0;
+  background:var(--accent);color:#fff;font-size:15px;font-weight:600;cursor:pointer;
+  font-family:inherit}
+button:hover{filter:brightness(1.08)}
+button:disabled{opacity:.6;cursor:default}
+.recent{margin-top:34px;font-size:13.5px}
+.recent a{color:var(--accent);text-decoration:none;margin-right:14px}
+.spin{display:none;margin-top:18px;color:var(--muted);font-size:14px}
+.spin.on{display:block}

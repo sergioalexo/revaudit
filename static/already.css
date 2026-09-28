@@ -1,0 +1,16 @@
+.prior{border:1px solid var(--line);border-radius:8px;background:var(--panel);
+  padding:13px 16px;margin:12px 0}
+.prior .pn{font-weight:600;font-size:15px}
+.prior .line{color:var(--muted);font-size:13px;margin:3px 0 0}
+.prior .line b{color:var(--fg);font-weight:600}
+.prior a.open{display:inline-block;margin-top:9px;color:var(--accent);
+  text-decoration:none;font-weight:600;font-size:13.5px}
+.prior a.open:hover{text-decoration:underline}
+.prior .gap{color:var(--warn);font-size:13px;margin:7px 0 0}
+.prior.fresh{background:transparent}
+.choices{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:8px}
+.choices form{margin:0}
+.choices button{margin:0}
+.choices button.second{background:var(--panel2);color:var(--fg);
+  border:1px solid var(--line)}
+.choices .back{color:var(--accent);text-decoration:none;font-size:13.5px}

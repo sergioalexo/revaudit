@@ -38,9 +38,9 @@ from onshape_client import (DEFAULT_BASE_URL, ET_ASSEMBLY, OnshapeClient,
 from pdf_export import (export_assembly_drawings, export_assembly_step_file,
                         export_counts, safe_filename, zip_pdfs)
 import config
-from revaudit import (APP_NAME, CSS, build_report, credit_html, data_json,
-                      load_dotenv, load_report, render_data, report_name_part,
-                      save_report)
+from revaudit import (APP_NAME, CSS, asset, build_report, credit_html,
+                      data_json, load_dotenv, load_report, render_data,
+                      report_name_part, save_report)
 
 HERE = Path(__file__).resolve().parent
 config.ensure_from_example()          # so `launch.bat` alone still works
@@ -479,26 +479,8 @@ def requested_checks(values):
 # pages
 # --------------------------------------------------------------------------
 
-FORM_CSS = """
-.form{max-width:640px}
-label{display:block;margin:18px 0 6px;font-weight:600;font-size:14px}
-.hint{color:var(--muted);font-weight:400;font-size:12.5px;margin-top:3px}
-input[type=text]{width:100%;padding:10px 12px;border-radius:7px;
-  border:1px solid var(--line);background:var(--panel);color:var(--fg);font-size:14px;
-  font-family:inherit}
-input[type=text]:focus{outline:2px solid var(--accent);outline-offset:1px}
-.row{display:flex;align-items:center;gap:9px;margin:16px 0}
-.row label{margin:0;font-weight:400}
-button{margin-top:26px;padding:12px 26px;border-radius:7px;border:0;
-  background:var(--accent);color:#fff;font-size:15px;font-weight:600;cursor:pointer;
-  font-family:inherit}
-button:hover{filter:brightness(1.08)}
-button:disabled{opacity:.6;cursor:default}
-.recent{margin-top:34px;font-size:13.5px}
-.recent a{color:var(--accent);text-decoration:none;margin-right:14px}
-.spin{display:none;margin-top:18px;color:var(--muted);font-size:14px}
-.spin.on{display:block}
-"""
+FORM_CSS = asset("form.css")
+FORM_JS = asset("form.js")
 
 
 def page(title, body):
@@ -631,34 +613,11 @@ def form_page(values=None, error=None, report_names=None):
       </form>
       {recent}
       <footer>{credit_html()}</footer>
-      <script>
-      function go(){{
-        document.getElementById('btn').disabled = true;
-        document.getElementById('btn').textContent = 'Running...';
-        document.getElementById('spin').classList.add('on');
-      }}
-      </script>
+      <script>{FORM_JS}</script>
     """)
 
 
-ALREADY_CSS = """
-.prior{border:1px solid var(--line);border-radius:8px;background:var(--panel);
-  padding:13px 16px;margin:12px 0}
-.prior .pn{font-weight:600;font-size:15px}
-.prior .line{color:var(--muted);font-size:13px;margin:3px 0 0}
-.prior .line b{color:var(--fg);font-weight:600}
-.prior a.open{display:inline-block;margin-top:9px;color:var(--accent);
-  text-decoration:none;font-weight:600;font-size:13.5px}
-.prior a.open:hover{text-decoration:underline}
-.prior .gap{color:var(--warn);font-size:13px;margin:7px 0 0}
-.prior.fresh{background:transparent}
-.choices{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:8px}
-.choices form{margin:0}
-.choices button{margin:0}
-.choices button.second{background:var(--panel2);color:var(--fg);
-  border:1px solid var(--line)}
-.choices .back{color:var(--accent);text-decoration:none;font-size:13.5px}
-"""
+ALREADY_CSS = asset("already.css")
 
 
 def hidden_fields_html(values, **overrides):
@@ -756,16 +715,8 @@ def already_run_page(values, entries):
     """)
 
 
-SHARE_CSS = """
-.share{display:flex;gap:8px;align-items:center;margin:0 0 18px;flex-wrap:wrap}
-.share input{flex:1;min-width:260px;padding:8px 10px;border-radius:6px;
-  border:1px solid var(--line);background:var(--panel);color:var(--fg);
-  font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
-.share button{margin:0;padding:8px 14px;font-size:13px;border-radius:6px;
-  border:1px solid var(--line);background:var(--panel2);color:var(--fg);cursor:pointer}
-.share button:hover{background:var(--panel)}
-.share .back{color:var(--accent);text-decoration:none;font-size:13.5px;white-space:nowrap}
-"""
+SHARE_CSS = asset("share.css")
+SHARE_JS = asset("share.js")
 
 
 def with_back_link(report_html, saved_name, share_url=None, data_url=None):
@@ -783,16 +734,7 @@ def with_back_link(report_html, saved_name, share_url=None, data_url=None):
             f"<button type='button' onclick='copyShareUrl()'>Copy link</button>"
             f"<span id='copied' style='color:var(--ok);font-size:12.5px;display:none'>"
             f"copied</span>{data_link}</div>"
-            # navigator.clipboard is undefined on a plain-http LAN address
-            # (not a secure context), so fall back to execCommand there
-            "<script>function copyShareUrl(){"
-            "const el=document.getElementById('shareUrl');el.select();"
-            "const done=()=>{const c=document.getElementById('copied');"
-            "c.style.display='inline';setTimeout(()=>c.style.display='none',1500);};"
-            "const legacy=()=>{try{document.execCommand('copy');}catch(e){}done();};"
-            "if(navigator.clipboard&&window.isSecureContext){"
-            "navigator.clipboard.writeText(el.value).then(done,legacy);}else{legacy();}}"
-            "</script>"
+            f"<script>{SHARE_JS}</script>"
         )
     bar = (
         f"<style>{SHARE_CSS}</style>"

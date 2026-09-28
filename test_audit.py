@@ -567,6 +567,24 @@ def main():
     check("reports not found", bool(res3["errors"]), True)
     check("no crash", res3.get("assembly"), None)
 
+    print("\nCSS/JS moved to static/")
+    static = Path(__file__).resolve().parent / "static"
+    for name in ("report.css", "copy.js", "form.css", "form.js",
+                "already.css", "share.css", "share.js"):
+        path = static / name
+        check(f"{name} exists and is non-empty",
+              path.is_file() and path.stat().st_size > 0, True)
+    report_page = render_data(build_report([res], "https://cad.example"))
+    check("report has the report.css selector", ".verdict.ok{" in report_page, True)
+    check("report has the copy-script body", "el.classList.add('copied')" in report_page,
+          True)
+    for name in ("copy.js", "form.js", "share.js"):
+        text = (static / name).read_text(encoding="utf-8")
+        check(f"{name} has no leftover f-string escaping",
+              "{{" in text or "}}" in text, False)
+        check(f"{name} has no <script> tag of its own",
+              "<script" in text.lower(), False)
+
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILURES: {', '.join(FAILS)}")

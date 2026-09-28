@@ -43,6 +43,13 @@ APP_NAME = "RevAudit"
 AUTHOR = "Sergio Alexo"
 AUTHOR_URL = "https://sergioalexo.com"
 
+STATIC = Path(__file__).resolve().parent / "static"
+
+
+def asset(name):
+    """CSS/JS source kept in static/; inlined into pages so reports stay self-contained."""
+    return (STATIC / name).read_text(encoding="utf-8")
+
 # Bumped whenever the saved report data changes shape in a way the renderer
 # has to know about. Older files are still rendered - every lookup is a
 # .get() - this just names the layout.
@@ -81,83 +88,7 @@ def load_dotenv(path):
 # HTML report
 # --------------------------------------------------------------------------
 
-CSS = """
-:root{
-  --bg:#ffffff; --panel:#f7f8fa; --panel2:#eef0f4; --fg:#12151a; --muted:#5d6673;
-  --line:#d9dee6; --accent:#2f6fed; --crit:#c02b2b; --crit-bg:#fdeaea;
-  --warn:#9a6400; --warn-bg:#fdf3e0; --ok:#1c7c4a; --ok-bg:#e8f6ee;
-}
-@media (prefers-color-scheme: dark){
-  :root:not([data-theme="light"]){
-    --bg:#0f1216; --panel:#171b21; --panel2:#1f242c; --fg:#e7ebf0; --muted:#98a2b0;
-    --line:#2a313a; --accent:#6f9bff; --crit:#ff6b6b; --crit-bg:#2a1616;
-    --warn:#e8b45c; --warn-bg:#2a2213; --ok:#5fd39a; --ok-bg:#12251b;
-  }
-}
-:root[data-theme="dark"]{
-  --bg:#0f1216; --panel:#171b21; --panel2:#1f242c; --fg:#e7ebf0; --muted:#98a2b0;
-  --line:#2a313a; --accent:#6f9bff; --crit:#ff6b6b; --crit-bg:#2a1616;
-  --warn:#e8b45c; --warn-bg:#2a2213; --ok:#5fd39a; --ok-bg:#12251b;
-}
-*{box-sizing:border-box}
-body{margin:0;padding:32px 24px 80px;background:var(--bg);color:var(--fg);
-  font:15px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-.wrap{max-width:1100px;margin:0 auto}
-h1{font-size:26px;margin:0 0 4px;letter-spacing:-.01em}
-h2{font-size:20px;margin:40px 0 12px;padding-top:20px;border-top:1px solid var(--line)}
-h3{font-size:15px;margin:26px 0 8px;text-transform:uppercase;letter-spacing:.06em;
-  color:var(--muted);font-weight:600}
-.sub{color:var(--muted);margin:0 0 28px;font-size:13px}
-.meta{display:flex;flex-wrap:wrap;gap:8px 20px;margin:10px 0 18px;font-size:13px;color:var(--muted)}
-.meta b{color:var(--fg);font-weight:600}
-.verdict{padding:14px 16px;border-radius:8px;margin:16px 0;font-weight:600;
-  border:1px solid transparent}
-.verdict.ok{background:var(--ok-bg);color:var(--ok);border-color:var(--ok)}
-.verdict.bad{background:var(--crit-bg);color:var(--crit);border-color:var(--crit)}
-.pills{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 4px}
-.pill{padding:4px 11px;border-radius:999px;font-size:12.5px;font-weight:600;
-  background:var(--panel2);border:1px solid var(--line)}
-.pill.ok{background:var(--ok-bg);color:var(--ok);border-color:var(--ok)}
-.pill.warn{background:var(--warn-bg);color:var(--warn);border-color:var(--warn)}
-.pill.crit{background:var(--crit-bg);color:var(--crit);border-color:var(--crit)}
-.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:10px 0 4px}
-table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:520px}
-th,td{text-align:left;padding:7px 12px;border-bottom:1px solid var(--line);
-  vertical-align:top}
-th{background:var(--panel);font-weight:600;font-size:12px;text-transform:uppercase;
-  letter-spacing:.04em;color:var(--muted);position:sticky;top:0}
-tbody tr:hover{background:var(--panel)}
-td.num{text-align:right;font-variant-numeric:tabular-nums}
-code,.mono{font-family:ui-monospace,"Cascadia Code",Consolas,monospace;font-size:12.5px}
-code{cursor:pointer;border-radius:3px;padding:0 2px;transition:background .12s}
-code:hover{background:var(--panel2)}
-code.copied{background:var(--ok-bg);color:var(--ok)}
-code.copied::after{content:" copied";font-size:11px}
-a.os{color:var(--accent);text-decoration:none;font-size:12px;margin-left:4px;
-  opacity:.65;vertical-align:baseline}
-a.os:hover{opacity:1;text-decoration:underline}
-.meta a{color:var(--accent);text-decoration:none}
-.meta a:hover{text-decoration:underline}
-.tag{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11.5px;
-  font-weight:700;letter-spacing:.03em}
-.tag.RELEASED{background:var(--ok-bg);color:var(--ok)}
-.tag.OBSOLETE{background:var(--crit-bg);color:var(--crit)}
-.tag.OTHER{background:var(--warn-bg);color:var(--warn)}
-.none{color:var(--muted);font-style:italic;margin:6px 0}
-.good{background:var(--ok-bg);color:var(--ok);border:1px solid var(--ok);
-  border-radius:7px;padding:9px 13px;margin:8px 0;font-weight:600;font-size:13.5px}
-.good::before{content:"✓  "}
-td .miss{color:var(--crit);font-weight:700}
-tr:has(.miss){background:var(--crit-bg)}
-details{margin:14px 0;border:1px solid var(--line);border-radius:8px;
-  background:var(--panel);padding:0 14px}
-summary{cursor:pointer;padding:11px 0;font-weight:600;font-size:14px}
-details[open]{padding-bottom:10px}
-.err{background:var(--crit-bg);color:var(--crit);padding:11px 14px;border-radius:8px;
-  margin:10px 0;font-size:13.5px}
-footer{margin-top:56px;padding-top:18px;border-top:1px solid var(--line);
-  color:var(--muted);font-size:12.5px}
-"""
+CSS = asset("report.css")
 
 
 def pretty_configuration(encoded):
@@ -706,37 +637,7 @@ def render_data(data):
     return "".join(parts)
 
 
-# Click any <code> token (part numbers, filenames, patterns) to copy it.
-# navigator.clipboard needs a secure context - fine over https or localhost,
-# blocked on a plain-http LAN IP, so there is an execCommand fallback.
-COPY_SCRIPT = """<script>
-(function(){
-  function copy(text){
-    if (navigator.clipboard && window.isSecureContext) {
-      return navigator.clipboard.writeText(text).catch(function(){ return legacy(text); });
-    }
-    return legacy(text);
-  }
-  function legacy(text){
-    var ta = document.createElement('textarea');
-    ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
-    document.body.appendChild(ta); ta.focus(); ta.select();
-    try { document.execCommand('copy'); } catch(e){}
-    document.body.removeChild(ta);
-    return Promise.resolve();
-  }
-  document.addEventListener('click', function(e){
-    var el = e.target.closest && e.target.closest('code');
-    if (!el) return;
-    var txt = (el.textContent || '').trim();
-    if (!txt) return;
-    copy(txt).then(function(){
-      el.classList.add('copied');
-      setTimeout(function(){ el.classList.remove('copied'); }, 900);
-    });
-  });
-})();
-</script>"""
+COPY_SCRIPT = f"<script>{asset('copy.js')}</script>"
 
 
 # --------------------------------------------------------------------------

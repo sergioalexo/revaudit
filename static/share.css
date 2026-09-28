@@ -1,0 +1,8 @@
+.share{display:flex;gap:8px;align-items:center;margin:0 0 18px;flex-wrap:wrap}
+.share input{flex:1;min-width:260px;padding:8px 10px;border-radius:6px;
+  border:1px solid var(--line);background:var(--panel);color:var(--fg);
+  font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
+.share button{margin:0;padding:8px 14px;font-size:13px;border-radius:6px;
+  border:1px solid var(--line);background:var(--panel2);color:var(--fg);cursor:pointer}
+.share button:hover{background:var(--panel)}
+.share .back{color:var(--accent);text-decoration:none;font-size:13.5px;white-space:nowrap}
