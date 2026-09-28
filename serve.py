@@ -732,15 +732,13 @@ def with_back_link(report_html, saved_name, share_url=None, data_url=None):
             f"<div class='share'><input readonly id='shareUrl' "
             f"value='{html.escape(share_url)}' onclick='this.select()'>"
             f"<button type='button' onclick='copyShareUrl()'>Copy link</button>"
-            f"<span id='copied' style='color:var(--ok);font-size:12.5px;display:none'>"
-            f"copied</span>{data_link}</div>"
+            f"<span id='copied' class='copied-flag'>copied</span>{data_link}</div>"
             f"<script>{SHARE_JS}</script>"
         )
     bar = (
         f"<style>{SHARE_CSS}</style>"
-        "<p style='margin:0 0 10px'><a class='back' href='/'>&larr; New audit</a>"
-        f"<span style='color:var(--muted);margin-left:16px;font-size:13px'>"
-        f"saved as {html.escape(saved_name)}</span></p>"
+        "<p class='backbar'><a class='back' href='/'>&larr; New audit</a>"
+        f"<span class='saved-as'>saved as {html.escape(saved_name)}</span></p>"
         f"{link_row}"
     )
     return report_html.replace("<div class='wrap'>", "<div class='wrap'>" + bar, 1)

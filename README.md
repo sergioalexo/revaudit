@@ -390,6 +390,7 @@ the download link, so nobody has to remember this paragraph.
 | `pdf_export.py` | Drawing PDF and assembly STEP export via Onshape's translation API |
 | `config.py` | Reads `revaudit.conf` — port, address, folder paths |
 | `test_audit.py` | Offline tests — mock client, no network or credentials needed |
+| `static/` | CSS/JS for the report and web UI, inlined into the HTML at render time |
 | `dxf_indexer.py` | Publishes a DXF/SAT filename index to a host that cannot see the share |
 | `install.bat` | Windows setup — config, shortcuts, optional Startup entry, firewall |
 | `autostart.bat` | Turns "start RevAudit when I log in" on or off (`on` / `off` / `status`); `keepalive on` / `off` adds or removes the every-10-minutes restart task |

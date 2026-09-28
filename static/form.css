@@ -16,3 +16,8 @@ button:disabled{opacity:.6;cursor:default}
 .recent a{color:var(--accent);text-decoration:none;margin-right:14px}
 .spin{display:none;margin-top:18px;color:var(--muted);font-size:14px}
 .spin.on{display:block}
+.signin-wrap{margin-top:28px}
+.signin-btn{display:inline-block;padding:12px 26px;border-radius:7px;
+  background:var(--accent);color:#fff;font-weight:600;text-decoration:none}
+.whoami{margin:0 0 18px;font-size:13px;color:var(--muted)}
+.whoami .signout{color:var(--accent);text-decoration:none}

@@ -197,10 +197,8 @@ def landing_page(error=None):
       {err}
       <p>Sign in with your own Onshape account. You will only ever see the
          documents your Onshape permissions already allow.</p>
-      <p style='margin-top:28px'>
-        <a href='/login' style='display:inline-block;padding:12px 26px;
-           border-radius:7px;background:var(--accent);color:#fff;font-weight:600;
-           text-decoration:none'>Sign in with Onshape</a>
+      <p class='signin-wrap'>
+        <a href='/login' class='signin-btn'>Sign in with Onshape</a>
       </p>
       <footer>{credit_html()}</footer>
     """)
@@ -209,9 +207,8 @@ def landing_page(error=None):
 def header_for(session):
     who = html.escape(session.get("name") or "signed in")
     return (
-        f"<p style='margin:0 0 18px;font-size:13px;color:var(--muted)'>{who}"
-        " &middot; <a href='/logout' style='color:var(--accent);"
-        "text-decoration:none'>sign out</a></p>"
+        f"<p class='whoami'>{who}"
+        " &middot; <a href='/logout' class='signout'>sign out</a></p>"
     )
 
 

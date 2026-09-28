@@ -631,7 +631,7 @@ def render_data(data):
         "case-insensitive with digit boundaries, so PRT-12 never matches PRT-123. "
         "Click any part number or filename to copy it; the &#8599; beside it opens that "
         "exact revision and configuration in Onshape."
-        "<p style='margin-top:14px'>" + credit_html(f"{APP_NAME} &middot; ") + "</p>"
+        "<p class='credit'>" + credit_html(f"{APP_NAME} &middot; ") + "</p>"
         "</footer>" + COPY_SCRIPT + "</div>" + data_block(data) + "</body></html>"
     )
     return "".join(parts)
