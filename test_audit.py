@@ -398,7 +398,7 @@ def main():
         check("forced STEP hits the API", bool(step_forced["error"]), True)
 
     print("\nreport names")
-    check("one assembly", report_name_part(["ASM-13417"]), "ASM-13417")
+    check("one assembly", report_name_part(["ASM-10001"]), "ASM-10001")
     check("several joined with +", report_name_part(["ASM-1", "ASM-2", "ASM-3"]),
           "ASM-1+ASM-2+ASM-3")
     check("more than three summarised",
@@ -407,24 +407,24 @@ def main():
     check("filename-unsafe and '_' become '.'", report_name_part(["A/B_C:D"]), "A.B.C.D")
     check("empty list", report_name_part([]), "audit")
     import serve
-    shared_ok = ["revaudit-20260921-083310-ASM-13417-3lCz5WsDO8K1yQza",
+    shared_ok = ["revaudit-20260921-083310-ASM-10001-3lCz5WsDO8K1yQza",
                  "revaudit-20260921-083310-ASM-1+ASM-2+2more-3lCz5WsDO8K1yQza.json",
                  "revaudit-20260918-152706-G88H_djHZ-rV4psI.html"]      # pre-name format
     check("shared names match", [bool(re.fullmatch(serve.SHARED_REPORT_RE, n))
                                  for n in shared_ok], [True] * 3)
-    legacy_ok = ["revaudit-20260921-083310_ASM-13417.json", "revaudit-20260918-152706.html",
+    legacy_ok = ["revaudit-20260921-083310_ASM-10001.json", "revaudit-20260918-152706.html",
                  "revaudit-20260921-083310_PRT-1234+PRT-5678+ASM-9"]
     check("CLI names never pass as shared",
           [bool(re.fullmatch(serve.SHARED_REPORT_RE, n)) for n in legacy_ok], [False] * 3)
     check("CLI names are legacy (password-gated)",
           [bool(re.fullmatch(serve.LEGACY_REPORT_RE, n)) for n in legacy_ok], [True] * 3)
     check("new web id shape", bool(re.fullmatch(serve.SHARED_REPORT_RE,
-                                                serve.new_report_id(["ASM-13417"]))), True)
+                                                serve.new_report_id(["ASM-10001"]))), True)
     check("label shows assemblies + time",
-          serve.report_label("revaudit-20260921-083310-ASM-13417+ASM-12859-3lCz5WsDO8K1yQza.json"),
-          "ASM-13417 + ASM-12859 \u00b7 2026-09-21 08:33")
-    check("label for CLI name", serve.report_label("revaudit-20260921-083310_ASM-13417.html"),
-          "ASM-13417 \u00b7 2026-09-21 08:33")
+          serve.report_label("revaudit-20260921-083310-ASM-10001+ASM-10002-3lCz5WsDO8K1yQza.json"),
+          "ASM-10001 + ASM-10002 \u00b7 2026-09-21 08:33")
+    check("label for CLI name", serve.report_label("revaudit-20260921-083310_ASM-10001.html"),
+          "ASM-10001 \u00b7 2026-09-21 08:33")
     check("label for old tokened name",
           serve.report_label("revaudit-20260918-152706-G88H_djHZ-rV4psI.html"),
           "2026-09-18 15:27")
@@ -474,8 +474,8 @@ def main():
           serve.report_pn_parts("revaudit-20260918-152706-G88H_djHZ-rV4psI"),
           ([], True))
     check("CLI name carries its assemblies",
-          serve.report_pn_parts("revaudit-20260921-083310_ASM-13417"),
-          (["ASM-13417"], False))
+          serve.report_pn_parts("revaudit-20260921-083310_ASM-10001"),
+          (["ASM-10001"], False))
     check("named report only matches its own",
           [serve.report_may_cover("revaudit-20260921-083310-ASM-1-3lCz5WsDO8K1yQza", f)
            for f in ("ASM-1", "ASM-2")], [True, False])

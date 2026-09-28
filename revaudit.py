@@ -476,7 +476,7 @@ def build_report(results, base_url, folder_notes=None, generated=None):
     renderer can re-render with whatever the report looks like by then.
 
     folder_notes: list of "Label path" strings shown in the subtitle, e.g.
-    ["DXF folder K:\\...\\DXF FILES", "SAT folder K:\\...\\SAT FILES"]. A bare
+    ["DXF folder <share>\\DXF FILES", "SAT folder <share>\\SAT FILES"]. A bare
     string is accepted too, for callers that only ever had one folder."""
     if isinstance(folder_notes, str):
         folder_notes = [folder_notes] if folder_notes else []
