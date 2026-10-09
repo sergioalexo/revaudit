@@ -38,8 +38,8 @@ from onshape_client import (DEFAULT_BASE_URL, ET_ASSEMBLY, OnshapeClient,
 from pdf_export import (export_assembly_drawings, export_assembly_step_file,
                         export_counts, safe_filename, zip_pdfs)
 import config
-from revaudit import (APP_NAME, CSS, asset, build_report, credit_html,
-                      data_json, load_dotenv, load_report, render_data,
+from revaudit import (APP_NAME, CSS, api_usage, api_usage_line, asset,
+                      build_report, credit_html, data_json, load_dotenv, load_report, render_data,
                       report_name_part, save_report)
 
 HERE = Path(__file__).resolve().parent
@@ -893,15 +893,23 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             with _run_lock:          # one audit at a time keeps API load predictable
+                # the client lives for the whole server, so this run's usage
+                # is the difference across it (the lock keeps runs apart)
+                calls0, cached0 = client.call_count, client.cached_count
                 results = run_audit(names, values)
+                audit_calls = client.call_count - calls0
                 run_exports(results, SERVER_STATE["client"], host, values)
+                api = api_usage(results, client.call_count - calls0,
+                                client.cached_count - cached0, audit_calls)
+            print(f"  {api_usage_line(api)}", file=sys.stderr)
         except OnshapeError as exc:
             return self._send(form_page(values, str(exc)))
         except Exception as exc:                      # noqa: BLE001
             traceback.print_exc()
             return self._send(form_page(values, f"{type(exc).__name__}: {exc}"))
 
-        data = build_report(results, self.server.base_url, folder_notes_for(values))
+        data = build_report(results, self.server.base_url, folder_notes_for(values),
+                            api=api)
         rid = new_report_id(names)
         saved = write_report(rid, data)             # configured folder, or app folder
         body = with_back_link(render_data(data), str(saved), *self._share_urls(rid))

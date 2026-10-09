@@ -469,7 +469,7 @@ def render_assembly(result):
     return "".join(out)
 
 
-def build_report(results, base_url, folder_notes=None, generated=None):
+def build_report(results, base_url, folder_notes=None, generated=None, api=None):
     """Everything a report needs, as one JSON-serialisable dict. It travels
     inside the saved HTML (see render_data / load_report), so a report file
     is both the page you double-click and the data a later version of the
@@ -477,7 +477,10 @@ def build_report(results, base_url, folder_notes=None, generated=None):
 
     folder_notes: list of "Label path" strings shown in the subtitle, e.g.
     ["DXF folder <share>\\DXF FILES", "SAT folder <share>\\SAT FILES"]. A bare
-    string is accepted too, for callers that only ever had one folder."""
+    string is accepted too, for callers that only ever had one folder.
+
+    api: the run's Onshape usage from api_usage(), kept so the reports
+    double as a record of how many calls a check costs."""
     if isinstance(folder_notes, str):
         folder_notes = [folder_notes] if folder_notes else []
     return {
@@ -487,7 +490,32 @@ def build_report(results, base_url, folder_notes=None, generated=None):
         "baseUrl": base_url,
         "folderNotes": list(folder_notes or []),
         "results": results,
+        **({"api": api} if api else {}),
     }
+
+
+def api_usage(results, calls, cached, audit_calls=None):
+    """{"calls", "cached", "auditCalls", "exportCalls", "assemblies", "parts"}
+    for one run. calls/cached are this run's share of the client's counters;
+    audit_calls splits off the export round trips when the caller knows it."""
+    usage = {
+        "calls": calls,
+        "cached": cached,
+        "assemblies": len(results),
+        "parts": sum(len(r.get("partStatuses") or {}) for r in results),
+    }
+    if audit_calls is not None:
+        usage["auditCalls"] = audit_calls
+        usage["exportCalls"] = calls - audit_calls
+    return usage
+
+
+def api_usage_line(usage):
+    """One greppable log line: 'api-calls 94 (audit 80, exports 14), ...'."""
+    split = (f" (audit {usage['auditCalls']}, exports {usage['exportCalls']})"
+             if "auditCalls" in usage else "")
+    return (f"api-calls {usage['calls']}{split}, {usage['cached']} from memory"
+            f" - {usage['assemblies']} assemblies, {usage['parts']} parts")
 
 
 # The report data rides inside the HTML in this block, so one file is both
@@ -570,6 +598,7 @@ def render_data(data):
     base_url = data.get("baseUrl") or ""
     folder_notes = data.get("folderNotes") or []
     generated = data.get("generated") or ""
+    api = data.get("api") or {}
     parts = [
         "<!doctype html><html><head><meta charset='utf-8'>",
         "<meta name='viewport' content='width=device-width,initial-scale=1'>",
@@ -577,6 +606,7 @@ def render_data(data):
         f"<h1>{APP_NAME}</h1>",
         f"<p class='sub'>Generated {esc(generated)} &middot; {esc(base_url)}"
         + "".join(f" &middot; {esc(note)}" for note in folder_notes)
+        + (f" &middot; {esc(api['calls'])} API calls" if "calls" in api else "")
         + "</p>",
     ]
 
@@ -930,7 +960,8 @@ def main(argv=None):
 
     # One self-contained .html: the page, with the audit data embedded so it
     # can be re-rendered (--render) or read as data later.
-    data = build_report(results, base_url, folder_notes)
+    data = build_report(results, base_url, folder_notes,
+                        api=api_usage(results, client.call_count, client.cached_count))
     # revaudit-<stamp>_<assemblies>: the '_' after the stamp is what tells the
     # web UI this is a CLI file with no share token in its name (see serve.py).
     stamp = ("revaudit-" + datetime.now().strftime("%Y%m%d-%H%M%S")
