@@ -45,20 +45,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import config
-from audit_core import audit_assembly
 from onshape_client import DEFAULT_BASE_URL, OnshapeClient, OnshapeError
-from revaudit import (APP_NAME, CSS, build_report, credit_html, data_json,
-                      load_dotenv, load_report, render_data)
-from serve import (FORM_CSS, already_run_page, build_file_checks, find_report,
-                   folder_notes_for, form_page, handle_index_upload,
-                   new_report_id, page, parse_run_form, prior_runs, report_id,
-                   run_exports, with_back_link, write_report)
+from report import APP_NAME, credit_html, data_json, load_report, render_data
+from report_store import find_report, prior_runs, report_id
+from webapp import (QuietServer, already_run_page, assembly_names, audit_and_report,
+                    form_error, form_page, handle_index_upload, page, read_form,
+                    send_download, with_back_link)
 
 HERE = Path(__file__).resolve().parent
 
@@ -218,6 +216,8 @@ def header_for(session):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "RevAudit"
+    # an idle or stalled connection gives its thread back after this long
+    timeout = 120
 
     def log_message(self, fmt, *args):
         sys.stderr.write("  %s\n" % (fmt % args))
@@ -275,6 +275,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/favicon.ico":
             return self._send(b"", 204, "image/x-icon")
+
+        if path.startswith("/download/"):
+            # gated by the random token in the name, like serve.py - a link
+            # handed to someone works without them signing in
+            return send_download(self, path[len("/download/"):])
 
         if path == "/login":
             redirect_uri = redirect_uri_for(self)
@@ -363,7 +368,8 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/report/"):
             name = path[len("/report/"):]
             rid = report_id(name)
-            target = find_report(name) if re.fullmatch(r"revaudit-[\w.-]+", name) else None
+            # '+' joins assembly numbers in multi-assembly report names
+            target = find_report(name) if re.fullmatch(r"revaudit-[\w.+-]+", name) else None
             # only this user's own reports - another user's, or one from
             # before this session, may cover documents they cannot see
             if rid not in session.get("reports", []) or target is None:
@@ -391,12 +397,13 @@ class Handler(BaseHTTPRequestHandler):
         if urlparse(self.path).path != "/run":
             return self._send(page("Not found", "<h1>Not found</h1>"), 404)
 
-        length = int(self.headers.get("Content-Length") or 0)
-        values = parse_run_form(parse_qs(self.rfile.read(length).decode("utf-8")))
-        names = [n for n in re.split(r"[\s,]+", values["assemblies"]) if n]
-        if not names:
-            return self._send(form_page(values, "Enter at least one assembly number.",
-                                       session.get("reports", [])))
+        values = read_form(self)
+        if values is None:
+            return self._send(page("Too large", "<h1>That form is too large</h1>"), 413)
+        error = form_error(values)
+        if error:
+            return self._send(form_page(values, error, session.get("reports", [])))
+        names = assembly_names(values)
 
         try:
             client = client_for(session)
@@ -413,7 +420,8 @@ class Handler(BaseHTTPRequestHandler):
             # would be a dead link, and it may cover documents they cannot
             # see. One memoised revision lookup per assembly.
             if values.get("force_run"):
-                client.forget_revisions()
+                if values.get("fresh"):
+                    client.forget_revisions()
             else:
                 entries = prior_runs(client, company_id, names,
                                      session.get("reports", []))
@@ -422,28 +430,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(body.replace(
                         "<h1>", header_for(session) + "<h1>", 1).encode("utf-8"))
 
-            file_checks = build_file_checks(values)
-            results = []
-            for name in names:
-                print(f"  [{session.get('name')}] auditing {name} ...", file=sys.stderr)
-                try:
-                    results.append(audit_assembly(
-                        client, company_id, name, file_checks, workers=6, deep=True,
-                    ))
-                except OnshapeError as exc:
-                    results.append(
-                        {"partNumber": name, "errors": [str(exc)], "findings": {}})
-            host = self.headers.get("Host", f"localhost:{self.server.server_port}")
-            run_exports(results, client, host, values)
-        except OnshapeError as exc:
-            return self._send(form_page(values, str(exc)))
+            host = self.headers.get("Host") or f"localhost:{self.server.server_port}"
+            rid, saved, data = audit_and_report(client, company_id, names, values, host,
+                                                CONFIG["base_url"], who=session.get("name"))
+        except (OnshapeError, OSError) as exc:
+            return self._send(form_page(values, str(exc), session.get("reports", [])))
         except Exception as exc:                                  # noqa: BLE001
             traceback.print_exc()
-            return self._send(form_page(values, f"{type(exc).__name__}: {exc}"))
+            return self._send(form_page(values, f"{type(exc).__name__}: {exc}",
+                                        session.get("reports", [])))
 
-        data = build_report(results, CONFIG["base_url"], folder_notes_for(values))
-        rid = new_report_id(names)
-        saved = write_report(rid, data)
         session.setdefault("reports", []).append(rid)
         body = with_back_link(render_data(data), str(saved)).replace(
             "<div class='wrap'>", "<div class='wrap'>" + header_for(session), 1)
@@ -462,7 +458,7 @@ def main(argv=None):
     host = args.host or config.bind_host()
     port = args.port or config.port()
 
-    load_dotenv(HERE / ".env")
+    config.load_dotenv(HERE / ".env")
     CONFIG["client_id"] = os.environ.get("ONSHAPE_OAUTH_CLIENT_ID")
     CONFIG["client_secret"] = os.environ.get("ONSHAPE_OAUTH_CLIENT_SECRET")
     CONFIG["scope"] = os.environ.get("ONSHAPE_OAUTH_SCOPE", "OAuth2Read OAuth2ReadPII")
@@ -499,7 +495,11 @@ def main(argv=None):
         )
         return 2
 
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    try:
+        httpd = QuietServer((host, port), Handler)
+    except OSError as exc:
+        print(f"Could not listen on {host}:{port}: {exc}", file=sys.stderr)
+        return 2
     _adv = config.advertised_address()
     _shown = _adv or ("localhost" if host in ("127.0.0.1", "localhost") else host)
     print(f"\n{APP_NAME} (OAuth) running at http://{_shown}:{port}")

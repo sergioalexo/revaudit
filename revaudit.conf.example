@@ -54,6 +54,12 @@ step =
 # Example: report = \\server\share\RevAudit Reports
 report =
 
+# The web UI keeps a copy of each run's drawing zip and STEP file in its own
+# drawings\ folder, behind the run's download links. Copies older than this
+# many days are deleted (the PDFs and STEP files in the folders above are
+# never touched - only these per-run copies). 0 = keep them forever.
+download_keep_days = 90
+
 
 [audit]
 
@@ -69,3 +75,8 @@ report =
 #
 # 600 = ten minutes. Set it to 0 to ask Onshape every single time.
 revision_cache_seconds = 600
+
+# Which BOM lines are "parts" that get the drawing / revision / DXF / SAT
+# checks: a regular expression matched against the part number. Hardware and
+# purchased items that don't match are only checked for their release state.
+part_pattern = ^PRT-

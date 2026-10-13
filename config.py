@@ -6,6 +6,9 @@ untouched; revaudit.conf just gives non-secret settings (ports, folders, the
 advertised IP) a friendlier home than environment variables.
 
 Secrets (Onshape keys, the site password) stay in .env - never here.
+
+REVAUDIT_CONF=<path> points at a different settings file, e.g. to run a
+second instance or a test copy against its own folders.
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ import socket
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-CONF_PATH = HERE / "revaudit.conf"
+CONF_PATH = Path(os.environ.get("REVAUDIT_CONF") or HERE / "revaudit.conf")
 
 # No built-in paths: the folders are site-specific, so they come from
 # revaudit.conf (or the REVAUDIT_*_DIR env vars). Blank = that check/export
@@ -24,6 +27,27 @@ CONF_PATH = HERE / "revaudit.conf"
 _FOLDER_DEFAULTS = {"dxf": "", "sat": "", "pdf": "", "step": ""}
 
 _parser = None
+
+
+def load_dotenv(path):
+    """Load KEY=VALUE lines from a .env file into os.environ. A variable
+    already set in the real environment wins over the file."""
+    path = Path(path)
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 def _load():
@@ -72,6 +96,17 @@ def report_dir():
     return str(HERE)          # not configured -> keep reports in the app folder
 
 
+def download_keep_days():
+    """How long the web UI keeps a run's download copies (the drawing zip and
+    the STEP copy behind each share link) before deleting them. The PDFs and
+    STEP files in the export folders are never touched. 0 keeps them forever."""
+    raw = get("folders", "download_keep_days", "REVAUDIT_DOWNLOAD_KEEP_DAYS", "90")
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 90
+
+
 def bind_host():
     """What the web server listens on. 0.0.0.0 = the LAN (a password in .env
     is then required); 127.0.0.1 = this machine only."""
@@ -96,6 +131,13 @@ def revision_cache_seconds():
         return max(0, int(raw))
     except (TypeError, ValueError):
         return 600
+
+
+def part_pattern():
+    """Regular expression a BOM line's part number must match to get the
+    per-part checks (drawing, revisions, DXF/SAT). Default: starts with PRT-."""
+    from audit_core import DEFAULT_PART_PATTERN
+    return get("audit", "part_pattern", "REVAUDIT_PART_PATTERN", DEFAULT_PART_PATTERN)
 
 
 def advertised_address():
@@ -128,8 +170,10 @@ def ensure_from_example():
     """Copy revaudit.conf.example -> revaudit.conf if the real one is missing,
     so `launch.bat` alone (without running install.bat first) still works.
     Returns True if it created the file."""
+    global _parser
     example = HERE / "revaudit.conf.example"
     if CONF_PATH.is_file() or not example.is_file():
         return False
     CONF_PATH.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+    _parser = None                # re-read: anything cached predates the file
     return True

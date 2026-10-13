@@ -24,8 +24,6 @@ Standard library only - no pip install required.
 from __future__ import annotations
 
 import argparse
-import html
-import json
 import os
 import re
 import sys
@@ -37,637 +35,8 @@ import config
 from audit_core import FileIndex, audit_assembly
 from onshape_client import DEFAULT_BASE_URL, OnshapeClient, OnshapeError
 from pdf_export import (export_assembly_drawings, export_assembly_step_file,
-                        export_counts, zip_pdfs)
-
-APP_NAME = "RevAudit"
-AUTHOR = "Sergio Alexo"
-AUTHOR_URL = "https://sergioalexo.com"
-
-STATIC = Path(__file__).resolve().parent / "static"
-
-
-def asset(name):
-    """CSS/JS source kept in static/; inlined into pages so reports stay self-contained."""
-    return (STATIC / name).read_text(encoding="utf-8")
-
-# Bumped whenever the saved report data changes shape in a way the renderer
-# has to know about. Older files are still rendered - every lookup is a
-# .get() - this just names the layout.
-REPORT_FORMAT = 1
-
-
-def credit_html(prefix=""):
-    """Byline shown in the report footer and on the web UI."""
-    return (
-        f"{prefix}Developed by <a href='{AUTHOR_URL}' target='_blank' "
-        f"rel='noopener noreferrer' style='color:var(--accent);"
-        f"text-decoration:none'>{AUTHOR}</a>"
-    )
-
-
-# --------------------------------------------------------------------------
-# config
-# --------------------------------------------------------------------------
-
-def load_dotenv(path):
-    """Load KEY=VALUE lines from a .env file into os.environ (no overwrite)."""
-    if not path.is_file():
-        return
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
-
-
-# --------------------------------------------------------------------------
-# HTML report
-# --------------------------------------------------------------------------
-
-CSS = asset("report.css")
-
-
-def pretty_configuration(encoded):
-    """'HEIGHT=1.016+meter;List_7yos=STEEL' -> 'HEIGHT=1.016 meter, STEEL'.
-    List_* keys are opaque Onshape ids, so only their values are shown."""
-    parts = []
-    for item in (encoded or "").split(";"):
-        key, _, val = item.partition("=")
-        val = val.replace("+", " ")
-        parts.append(val if key.startswith("List_") else f"{key}={val}" if val else key)
-    return ", ".join(p for p in parts if p)
-
-
-def esc(value):
-    if value is None:
-        return ""
-    return html.escape(str(value))
-
-
-def state_tag(state):
-    cls = state if state in ("RELEASED", "OBSOLETE") else "OTHER"
-    return f'<span class="tag {cls}">{esc(state or "-")}</span>'
-
-
-def os_link(url, title="Open in Onshape", text="&#8599;"):
-    """A small arrow that opens url in a new tab - the Onshape document at
-    the exact version and configuration the audit looked at. Empty when the
-    record carried no link (older saved reports, mock data)."""
-    if not url:
-        return ""
-    return (f'<a class="os" href="{esc(url)}" target="_blank" rel="noopener noreferrer" '
-            f'title="{esc(title)}">{text}</a>')
-
-
-def pn_cell(pn, url=None, title="Open the part in Onshape", extra_class=""):
-    """Part number as a click-to-copy token, followed by its Onshape link."""
-    cls = f' class="{extra_class}"' if extra_class else ""
-    return f"<code{cls}>{esc(pn)}</code>{os_link(url, title)}"
-
-
-def rev_cell(rev, url=None, title="Open this revision in Onshape", bold=False):
-    text = f"<b>{esc(rev)}</b>" if bold else esc(rev)
-    return f"{text}{os_link(url, title)}"
-
-
-def table(headers, rows, aligns=None):
-    if not rows:
-        return ""
-    aligns = aligns or [""] * len(headers)
-    out = ['<div class="scroll"><table><thead><tr>']
-    out += [f"<th>{esc(h)}</th>" for h in headers]
-    out.append("</tr></thead><tbody>")
-    for row in rows:
-        out.append("<tr>")
-        for value, align in zip(row, aligns):
-            cls = ' class="num"' if align == "num" else ""
-            out.append(f"<td{cls}>{value}</td>")
-        out.append("</tr>")
-    out.append("</tbody></table></div>")
-    return "".join(out)
-
-
-def section(title, body, empty_note=None):
-    """empty_note is always a clean/passing result, so it renders in green."""
-    if not body:
-        if not empty_note:
-            return ""
-        return f"<h3>{esc(title)}</h3><p class=\"good\">{esc(empty_note)}</p>"
-    return f"<h3>{esc(title)}</h3>{body}"
-
-
-def render_assembly(result):
-    out = []
-    pn = result["partNumber"]
-    out.append(f'<h2 id="{esc(pn)}">{esc(pn)}</h2>')
-
-    for err in result.get("errors", []):
-        out.append(f'<div class="err">{esc(err)}</div>')
-
-    asm = result.get("assembly")
-    if not asm:
-        return "".join(out)
-
-    dwg = asm["drawingRevision"]
-    out.append(
-        '<div class="meta">'
-        f'<span>Document <b>{esc(asm["documentName"])}</b></span>'
-        f'<span>Assembly rev <b>{esc(asm["revision"])}</b>'
-        f'{os_link(asm.get("url"), "Open the released assembly in Onshape")}</span>'
-        f'<span>Released <b>{esc(asm["releaseDate"] or "-")}</b></span>'
-        f'<span>Assembly drawing <b>{esc(dwg or "none")}</b>'
-        f'{os_link(asm.get("drawingUrl"), "Open the assembly drawing in Onshape")}</span>'
-        f'<span>Source <b>{esc(result.get("bomSource", ""))}</b></span>'
-        + (f'<span>Configuration <b>{esc(pretty_configuration(asm["configuration"]))}</b></span>'
-           if asm.get("configuration") else "")
-        + "</div>"
-    )
-
-    f = result.get("findings", {})
-    statuses = result.get("partStatuses", {})
-    total_parts = len(statuses)
-    no_drawing = f.get("noDrawing", [])
-    with_drawing = total_parts - len(no_drawing)
-
-    if total_parts:
-        if no_drawing:
-            out.append(
-                f'<div class="verdict bad">{with_drawing} of {total_parts} parts have a '
-                f'released drawing &mdash; {len(no_drawing)} have none.</div>'
-            )
-        else:
-            out.append(
-                f'<div class="verdict ok">All {total_parts} parts have a released '
-                "drawing.</div>"
-            )
-
-    counts = result.get("stateCounts", {})
-    pills = []
-    for key in ("RELEASED", "OBSOLETE"):
-        if counts.get(key):
-            cls = "ok" if key == "RELEASED" else "crit"
-            pills.append(f'<span class="pill {cls}">{counts[key]} {key.lower()}</span>')
-    for key, val in sorted(counts.items()):
-        if key not in ("RELEASED", "OBSOLETE"):
-            pills.append(f'<span class="pill warn">{val} {esc(key.lower())}</span>')
-    rows = result.get("rows", [])
-    pills.append(f'<span class="pill">{len(rows)} BOM lines</span>')
-    pills.append(f'<span class="pill">{total_parts} unique parts</span>')
-    out.append('<div class="pills">' + "".join(pills) + "</div>")
-
-    # 1. no drawing
-    body = table(
-        ["Part", "Name", "Material", "Qty", "Part rev", "Source document"],
-        [
-            [pn_cell(e["pn"], e.get("partUrl")), esc(e["name"]), esc(e["material"]),
-             esc(e["qty"]), rev_cell(e["partRev"], e.get("partUrl")), esc(e["sourceDoc"])]
-            for e in no_drawing
-        ],
-        ["", "", "", "num", "", ""],
-    )
-    out.append(section("Parts with no drawing at all", body,
-                       "None - every part has a released drawing."))
-
-    # 2. drawing behind part
-    behind = f.get("drawingBehindPart", [])
-    body = table(
-        ["Part", "Name", "Part rev", "Newest drawing rev", "Qty"],
-        [
-            [pn_cell(e["pn"], e.get("partUrl")), esc(e["name"]),
-             rev_cell(e["partRev"], e.get("partUrl"), "Open the part revision in Onshape"),
-             rev_cell(e["drawingRev"], e.get("drawingUrl"),
-                      "Open the drawing revision in Onshape", bold=True),
-             esc(e["qty"])]
-            for e in behind
-        ],
-        ["", "", "", "", "num"],
-    )
-    out.append(section("Drawing older than the part it documents", body,
-                       "None - no drawing lags its part revision."))
-
-    # 3. duplicate part numbers
-    dups = [d for d in f.get("duplicatePartNumbers", []) if d["mixedRevisions"]]
-    dup_rows = []
-    for d in dups:
-        detail = " &nbsp;/&nbsp; ".join(
-            f'item {esc(l["item"])}: rev <b>{esc(l["rev"])}</b>'
-            f'{os_link(l.get("url"), "Open this BOM line in Onshape")} '
-            f'&times;{esc(l["qty"])} {state_tag(l["state"])}'
-            for l in d["lines"]
-        )
-        total = sum((l["qty"] or 0) for l in d["lines"])
-        first_url = next((l.get("url") for l in d["lines"] if l.get("url")), None)
-        dup_rows.append([pn_cell(d["pn"], first_url, "Open in Onshape"), detail, esc(total)])
-    out.append(section(
-        "Same part number at two or more revisions",
-        table(["Part", "Lines", "Total qty"], dup_rows, ["", "", "num"]),
-        "None - every part number appears at a single revision.",
-    ))
-
-    # 4. obsolete lines
-    obs = f.get("obsoleteLines", [])
-    orphans = [o for o in obs if not o["supersededInBom"]]
-    body = table(
-        ["Item", "Part", "Name", "Rev", "Qty", "Superseded in this BOM?"],
-        [
-            [esc(o["item"]), pn_cell(o["pn"], o.get("url"), "Open this BOM line in Onshape"),
-             esc(o["name"]), esc(o["rev"]), esc(o["qty"]),
-             "yes" if o["supersededInBom"] else "<b>no</b>"]
-            for o in obs
-        ],
-        ["num", "", "", "", "num", ""],
-    )
-    title = f"Obsolete BOM lines ({len(orphans)} with no newer line in this BOM)"
-    out.append(section(title, body, "None - no obsolete lines."))
-
-    # 5. BOM rev stale
-    stale = f.get("bomRevStale", [])
-    body = table(
-        ["Part", "Name", "Rev in BOM", "Current part rev", "Qty"],
-        [
-            [pn_cell(e["pn"], e.get("partUrl")), esc(e["name"]),
-             esc(", ".join(e.get("bomRevs") or [])),
-             rev_cell(e["partRev"], e.get("partUrl"), "Open the current part revision",
-                      bold=True),
-             esc(e["qty"])]
-            for e in stale
-        ],
-        ["", "", "", "", "num"],
-    )
-    out.append(section("BOM pins a revision older than the current part", body,
-                       "None - the BOM references current part revisions."))
-
-    # 6. not revision managed
-    unmanaged = f.get("notRevisionManaged", [])
-    body = table(
-        ["Item", "Part", "Name", "State", "Qty"],
-        [
-            [esc(u["item"]), pn_cell(u["pn"], u.get("url"), "Open this BOM line in Onshape"),
-             esc(u["name"]), state_tag(u["state"]), esc(u["qty"])]
-            for u in unmanaged
-        ],
-        ["num", "", "", "", "num"],
-    )
-    out.append(section("Lines with no released revision", body,
-                       "None - every line is revision-managed."))
-
-    # 7. workspace drift
-    drift = f.get("workspaceDrift")
-    if drift:
-        if drift["drifted"]:
-            ws = ", ".join(f"{v} {k.lower()}" for k, v in sorted(drift["workspaceCounts"].items()))
-            vs = ", ".join(f"{v} {k.lower()}" for k, v in sorted(drift["versionCounts"].items()))
-            body = (
-                f'<p>The live workspace differs from the released version.</p>'
-                f'<div class="scroll"><table><thead><tr><th>Source</th><th>Lines</th>'
-                f'<th>States</th></tr></thead><tbody>'
-                f'<tr><td>Released Rev {esc(result["assembly"]["revision"])}</td>'
-                f'<td class="num">{drift["versionLines"]}</td><td>{esc(vs)}</td></tr>'
-                f'<tr><td>Main workspace</td><td class="num">{drift["workspaceLines"]}</td>'
-                f'<td>{esc(ws)}</td></tr></tbody></table></div>'
-            )
-        else:
-            body = ('<p class="good">The live workspace matches the released version '
-                    "line for line.</p>")
-        out.append(f"<h3>Workspace vs released version</h3>{body}")
-
-    # 8. production-file coverage - DXF, SAT, or whatever else was checked
-    for check_name, fc in (f.get("files") or {}).items():
-        out.append(f"<h3>{esc(check_name)} coverage</h3>")
-        stale_note = ""
-        if fc.get("source") == "uploaded index" and fc.get("generated"):
-            stale_note = f'<span>Index generated <b>{esc(fc["generated"])}</b></span>'
-        out.append(
-            f'<div class="meta"><span>Folder <b>{esc(fc["folder"])}</b></span>'
-            f'<span>Files indexed <b>{fc["filesIndexed"]}</b></span>'
-            f'<span>Parts expecting {esc(check_name)} <b>{fc["expected"]}</b></span>'
-            f'<span>Material pattern <code>{esc(fc["materialPattern"])}</code></span>'
-            f'{stale_note}</div>'
-        )
-        if fc["missing"]:
-            n = len(fc["missing"])
-            plural = "s" if n != 1 else ""
-            verb = "are" if n != 1 else "is"
-            out.append(f'<div class="verdict bad">{n} part{plural} {verb} missing '
-                       f'a {esc(check_name)} file.</div>')
-            out.append(table(
-                ["Part", "Name", "Material", "Qty"],
-                [
-                    [pn_cell(m["pn"], m.get("partUrl"), extra_class="miss"),
-                     f'<span class="miss">{esc(m["name"])}</span>',
-                     esc(m["material"]), esc(m["qty"])]
-                    for m in fc["missing"]
-                ],
-                ["", "", "", "num"],
-            ))
-        else:
-            out.append(f'<p class="good">Every part expecting {esc(check_name)} has one.</p>')
-        if fc.get("multiple"):
-            rows_m = [
-                [pn_cell(m["pn"], m.get("partUrl")), esc(m["name"]),
-                 f'<b>{len(m["files"])}</b>',
-                 " &nbsp;".join(f"<code>{esc(fn)}</code>" for fn in m["files"])]
-                for m in fc["multiple"]
-            ]
-            out.append(
-                f"<details open><summary>Parts with more than one {esc(check_name)} "
-                f"file ({len(fc['multiple'])}) &mdash; check the extras are variants, "
-                "not stale duplicates</summary>"
-                + table(["Part", "Name", "Files", ""], rows_m, ["", "", "num", ""])
-                + "</details>"
-            )
-        if fc["unexpected"]:
-            rows_u = [
-                [pn_cell(u["pn"], u.get("partUrl")), esc(u["material"]),
-                 esc(", ".join(u["files"][:4]))]
-                for u in fc["unexpected"]
-            ]
-            out.append(
-                f"<details><summary>Parts with a {esc(check_name)} file that were not "
-                f"expected to need one ({len(fc['unexpected'])})</summary>"
-                + table(["Part", "Material", "Files"], rows_u) + "</details>"
-            )
-
-    # 9. drawing PDF export, if requested
-    export = result.get("drawingExport")
-    if export:
-        entries = export.get("entries", [])
-        exported, skipped, n_failed = export_counts(entries)
-        failed = [e for e in entries if e.get("error")]
-        out.append("<h3>Drawing PDF export</h3>")
-        if exported or skipped:
-            cls = "bad" if failed else "ok"
-            bits = []
-            if exported:
-                bits.append(f"{exported} drawing PDF{'s' if exported != 1 else ''} exported")
-            if skipped:
-                bits.append(f"{skipped} already in the folder at the current revision "
-                            "(not fetched again)")
-            if failed:
-                bits.append(f"{n_failed} failed")
-            out.append(f'<div class="verdict {cls}">{", ".join(bits)}.</div>')
-        elif failed:
-            out.append(f'<div class="verdict bad">All {len(failed)} drawing exports '
-                       "failed.</div>")
-        if export.get("zipUrl"):
-            out.append(
-                f'<p><a href="{esc(export["zipUrl"])}" style="color:var(--accent)">'
-                f'Download the drawing package (.zip)</a></p>'
-            )
-        elif export.get("zipPath"):
-            out.append(f'<p>Saved to <code>{esc(export["zipPath"])}</code></p>')
-        if failed:
-            out.append("<details><summary>Failed exports "
-                       f"({len(failed)})</summary>" + table(
-                ["Part", "Rev", "Error"],
-                [[f'<code>{esc(e["pn"])}</code>', esc(e["rev"]), esc(e["error"])]
-                 for e in failed],
-            ) + "</details>")
-
-    # 10. STEP export, if requested
-    step = result.get("stepExport")
-    if step:
-        out.append("<h3>STEP export</h3>")
-        if step.get("error"):
-            out.append(f'<div class="verdict bad">Export failed: {esc(step["error"])}</div>')
-        elif step.get("skipped"):
-            out.append('<div class="verdict ok">Already in the folder at this revision '
-                       "&mdash; not fetched again.</div>")
-        else:
-            out.append('<div class="verdict ok">Exported.</div>')
-            if step.get("url"):
-                out.append(f'<p><a href="{esc(step["url"])}" style="color:var(--accent)">'
-                           f'Download the STEP file</a></p>')
-            elif step.get("path"):
-                out.append(f'<p>Saved to <code>{esc(step["path"])}</code></p>')
-            out.append(
-                '<p class="hint" style="color:var(--muted);font-size:12.5px">'
-                "Component names inside this file use Onshape's part <b>name</b> unless "
-                "an Export Rule mapping to Part Number is configured in Company Settings "
-                "&rarr; Preferences &rarr; Export Rules (object type Part, format STEP, "
-                "convention <code>${partNumber}</code>). Confirmed by testing: passing "
-                "evaluateExportRule alone does nothing without that rule in place.</p>"
-            )
-
-    # full BOM
-    bom_rows = [
-        [esc(r["item"]), pn_cell(r["pn"], r.get("url"), "Open this BOM line in Onshape"),
-         esc(r["name"]), esc(r["rev"]), state_tag(r["state"]), esc(r["qty"]),
-         esc(r["material"])]
-        for r in rows
-    ]
-    out.append(
-        f"<details><summary>Full BOM ({len(rows)} lines)</summary>"
-        + table(["Item", "Part", "Name", "Rev", "State", "Qty", "Material"], bom_rows,
-                ["num", "", "", "", "", "num", ""])
-        + "</details>"
-    )
-    return "".join(out)
-
-
-def build_report(results, base_url, folder_notes=None, generated=None, api=None):
-    """Everything a report needs, as one JSON-serialisable dict. It travels
-    inside the saved HTML (see render_data / load_report), so a report file
-    is both the page you double-click and the data a later version of the
-    renderer can re-render with whatever the report looks like by then.
-
-    folder_notes: list of "Label path" strings shown in the subtitle, e.g.
-    ["DXF folder <share>\\DXF FILES", "SAT folder <share>\\SAT FILES"]. A bare
-    string is accepted too, for callers that only ever had one folder.
-
-    api: the run's Onshape usage from api_usage(), kept so the reports
-    double as a record of how many calls a check costs."""
-    if isinstance(folder_notes, str):
-        folder_notes = [folder_notes] if folder_notes else []
-    return {
-        "app": APP_NAME,
-        "format": REPORT_FORMAT,
-        "generated": generated or datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "baseUrl": base_url,
-        "folderNotes": list(folder_notes or []),
-        "results": results,
-        **({"api": api} if api else {}),
-    }
-
-
-def api_usage(results, calls, cached, audit_calls=None):
-    """{"calls", "cached", "auditCalls", "exportCalls", "assemblies", "parts"}
-    for one run. calls/cached are this run's share of the client's counters;
-    audit_calls splits off the export round trips when the caller knows it."""
-    usage = {
-        "calls": calls,
-        "cached": cached,
-        "assemblies": len(results),
-        "parts": sum(len(r.get("partStatuses") or {}) for r in results),
-    }
-    if audit_calls is not None:
-        usage["auditCalls"] = audit_calls
-        usage["exportCalls"] = calls - audit_calls
-    return usage
-
-
-def api_usage_line(usage):
-    """One greppable log line: 'api-calls 94 (audit 80, exports 14), ...'."""
-    split = (f" (audit {usage['auditCalls']}, exports {usage['exportCalls']})"
-             if "auditCalls" in usage else "")
-    return (f"api-calls {usage['calls']}{split}, {usage['cached']} from memory"
-            f" - {usage['assemblies']} assemblies, {usage['parts']} parts")
-
-
-# The report data rides inside the HTML in this block, so one file is both
-# the readable page and the record. type=application/json means the browser
-# never runs it; only "</" needs escaping so the block can't end early.
-DATA_TAG_OPEN = '<script type="application/json" id="revaudit-data">'
-DATA_TAG_CLOSE = "</script>"
-_DATA_BLOCK_RE = re.compile(re.escape(DATA_TAG_OPEN) + r"(.*?)" + re.escape(DATA_TAG_CLOSE),
-                            re.DOTALL)
-
-
-def data_json(data):
-    """Compact JSON for embedding or for the /report/<id>.json endpoint."""
-    return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
-
-
-def data_block(data):
-    return DATA_TAG_OPEN + data_json(data).replace("</", "<\\/") + DATA_TAG_CLOSE
-
-
-def save_report(path, data):
-    """Write the report as a self-contained .html with its data embedded.
-    Returns the Path."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_data(data), encoding="utf-8")
-    return path
-
-
-def extract_data(html_text):
-    """The embedded report data from rendered HTML, or None if it has none
-    (a report saved before data was embedded)."""
-    m = _DATA_BLOCK_RE.search(html_text)
-    if not m:
-        return None
-    data = json.loads(m.group(1))
-    return data if isinstance(data, dict) and "results" in data else None
-
-
-def load_report(path):
-    """Read report data back from a saved .html (embedded block) or from a
-    bare .json written by the short-lived JSON-file format. Raises
-    ValueError if the file is neither."""
-    text = Path(path).read_text(encoding="utf-8")
-    if text.lstrip().startswith("{"):
-        data = json.loads(text)
-        if isinstance(data, dict) and "results" in data:
-            return data
-        raise ValueError(f"{path} is not a {APP_NAME} report")
-    data = extract_data(text)
-    if data is None:
-        raise ValueError(f"{path} has no embedded {APP_NAME} data")
-    return data
-
-
-def report_name_part(part_numbers, limit=3):
-    """The assembly numbers as a filename fragment: up to `limit` of them
-    joined with '+', then '+<n>more'. Anything a filename can't hold - or
-    that the report-name regexes treat as structure ('-' is fine, '_' is
-    not) - becomes '.'."""
-    clean = [re.sub(r"[^A-Za-z0-9.\-]+", ".", str(pn)).strip(".") or "x"
-             for pn in part_numbers]
-    clean = [c[:24] for c in clean if c]
-    if not clean:
-        return "audit"
-    shown = "+".join(clean[:limit])
-    if len(clean) > limit:
-        shown += f"+{len(clean) - limit}more"
-    return shown
-
-
-def render_report(results, base_url, folder_notes=None, generated=None):
-    """Render straight from audit results - build_report + render_data."""
-    return render_data(build_report(results, base_url, folder_notes, generated))
-
-
-def render_data(data):
-    """The HTML report for a dict from build_report / load_report."""
-    results = data.get("results") or []
-    base_url = data.get("baseUrl") or ""
-    folder_notes = data.get("folderNotes") or []
-    generated = data.get("generated") or ""
-    api = data.get("api") or {}
-    parts = [
-        "<!doctype html><html><head><meta charset='utf-8'>",
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>",
-        f"<title>{APP_NAME}</title><style>{CSS}</style></head><body><div class='wrap'>",
-        f"<h1>{APP_NAME}</h1>",
-        f"<p class='sub'>Generated {esc(generated)} &middot; {esc(base_url)}"
-        + "".join(f" &middot; {esc(note)}" for note in folder_notes)
-        + (f" &middot; {esc(api['calls'])} API calls" if "calls" in api else "")
-        + "</p>",
-    ]
-
-    if len(results) > 1:
-        # column names come from whichever file checks any assembly used
-        check_names = []
-        for r in results:
-            for name in (r.get("findings", {}).get("files") or {}):
-                if name not in check_names:
-                    check_names.append(name)
-
-        summary = []
-        for r in results:
-            f = r.get("findings", {})
-            asm = r.get("assembly")
-            if not asm:
-                summary.append(
-                    [pn_cell(r["partNumber"]), "<b>not found</b>", "", "", ""]
-                    + ["" for _ in check_names])
-                continue
-            nd = len(f.get("noDrawing", []))
-            beh = len(f.get("drawingBehindPart", []))
-            dup = len([d for d in f.get("duplicatePartNumbers", []) if d["mixedRevisions"]])
-            row = [
-                f'<a href="#{esc(r["partNumber"])}"><code>{esc(r["partNumber"])}</code></a>'
-                f'{os_link(asm.get("url"), "Open the released assembly in Onshape")}',
-                esc(asm["revision"]),
-                f"<b>{nd}</b>" if nd else "0",
-                f"<b>{beh}</b>" if beh else "0",
-                f"<b>{dup}</b>" if dup else "0",
-            ]
-            files = f.get("files") or {}
-            for name in check_names:
-                miss = len(files.get(name, {}).get("missing", []))
-                row.append(f'<span class="miss">{miss}</span>' if miss else "0")
-            summary.append(row)
-        parts.append("<h3>Summary</h3>")
-        parts.append(table(
-            ["Assembly", "Rev", "No drawing", "Drawing behind part",
-             "Mixed-rev part numbers"] + [f"Missing {n}" for n in check_names],
-            summary, ["", "", "num", "num", "num"] + ["num"] * len(check_names),
-        ))
-
-    for result in results:
-        parts.append(render_assembly(result))
-
-    parts.append(
-        "<footer>A part is counted as released when it has a non-obsolete revision in "
-        "the company revision registry &mdash; in Onshape a revision only exists once a "
-        "release completes. Part revisions and drawing revisions are queried separately, "
-        "which is what surfaces a drawing that lags its part. File matching (DXF, SAT) is "
-        "case-insensitive with digit boundaries, so PRT-12 never matches PRT-123. "
-        "Click any part number or filename to copy it; the &#8599; beside it opens that "
-        "exact revision and configuration in Onshape."
-        "<p class='credit'>" + credit_html(f"{APP_NAME} &middot; ") + "</p>"
-        "</footer>" + COPY_SCRIPT + "</div>" + data_block(data) + "</body></html>"
-    )
-    return "".join(parts)
-
-
-COPY_SCRIPT = f"<script>{asset('copy.js')}</script>"
+                        export_counts, safe_filename, zip_pdfs)
+from report import api_usage, build_report, load_report, report_name_part, save_report
 
 
 # --------------------------------------------------------------------------
@@ -721,7 +90,7 @@ def print_summary(result):
 
 def main(argv=None):
     here = Path(__file__).resolve().parent
-    load_dotenv(here / ".env")     # before the parser: export defaults read env vars
+    config.load_dotenv(here / ".env")   # before the parser: export defaults read env vars
 
     parser = argparse.ArgumentParser(
         prog="revaudit",
@@ -800,8 +169,13 @@ def main(argv=None):
     parser.add_argument("--company-id", help="company id (auto-detected by default)")
     parser.add_argument("--workers", type=int, default=6,
                         help="parallel API lookups (default: 6)")
+    parser.add_argument("--part-pattern", default=config.part_pattern(), metavar="REGEX",
+                        help="part numbers that get the per-part drawing/revision/file "
+                             "checks (default: revaudit.conf [audit] part_pattern, "
+                             "else '^PRT-')")
     parser.add_argument("--no-deep", action="store_true",
-                        help="skip the extra element-type sweep on parts with no drawing")
+                        help="don't list what else is released under a part number that "
+                             "has no drawing (it costs no API calls either way)")
     parser.add_argument("-v", "--verbose", action="store_true", help="log every API call")
     args = parser.parse_args(argv)
 
@@ -820,6 +194,15 @@ def main(argv=None):
         return 0
     if not args.assemblies:
         parser.error("give at least one assembly number, or --render FILE")
+    if args.workers < 1 or args.drawing_workers < 1:
+        parser.error("--workers and --drawing-workers must be at least 1")
+    try:
+        regexes = {flag: re.compile(raw, re.IGNORECASE) for flag, raw in (
+            ("--material-regex", args.material_regex),
+            ("--sat-material-regex", args.sat_material_regex),
+            ("--part-pattern", args.part_pattern))}
+    except re.error as exc:
+        parser.error(f"not a valid regular expression: {exc}")
 
     def export_dir(flag, kind, disabled, fallback):
         """--export-X semantics: absent -> the configured folder (or off);
@@ -869,10 +252,9 @@ def main(argv=None):
 
         file_checks = []
         folder_notes = []
-        for check_name, folder, recursive, ext_str, regex_str in (
-            ("DXF", args.dxf_dir, args.dxf_recursive, args.dxf_ext, args.material_regex),
-            ("SAT", args.sat_dir, args.sat_recursive, args.sat_ext,
-             args.sat_material_regex),
+        for check_name, folder, recursive, ext_str, regex_flag in (
+            ("DXF", args.dxf_dir, args.dxf_recursive, args.dxf_ext, "--material-regex"),
+            ("SAT", args.sat_dir, args.sat_recursive, args.sat_ext, "--sat-material-regex"),
         ):
             index = None
             if folder:
@@ -883,16 +265,19 @@ def main(argv=None):
             file_checks.append({
                 "name": check_name,
                 "index": index,
-                "material_regex": re.compile(regex_str, re.IGNORECASE),
+                "material_regex": regexes[regex_flag],
             })
 
         results = []
+        audit_calls = client.call_count        # the company lookup counts as audit
         for asm_pn in args.assemblies:
             print(f"Auditing {asm_pn} ...")
+            calls_before = client.call_count
             try:
                 result = audit_assembly(
                     client, company_id, asm_pn, file_checks,
                     workers=args.workers, deep=not args.no_deep, verbose=args.verbose,
+                    part_pattern=regexes["--part-pattern"],
                 )
             except OnshapeError as exc:
                 # keep going so one bad assembly does not lose the whole batch
@@ -901,6 +286,8 @@ def main(argv=None):
                     {"partNumber": asm_pn, "errors": [str(exc)], "findings": {}}
                 )
                 continue
+            finally:
+                audit_calls += client.call_count - calls_before
 
             if pdf_dir and result.get("assembly"):
                 # Flat, like the DXF/SAT folders - not one subfolder per
@@ -913,15 +300,22 @@ def main(argv=None):
                 def progress(done, total, _pn=asm_pn):
                     print(f"    {_pn}: {done}/{total} drawings checked", end="\r")
 
-                entries = export_assembly_drawings(
-                    client, result, out_dir, workers=args.drawing_workers,
-                    on_progress=progress, force=args.force_export,
-                )
-                print()  # clear the \r progress line
-                # The zip is a one-off snapshot of this run, not part of the
-                # permanent archive, so it stays next to the report - not in
-                # the shared K: folder alongside everyone's individual PDFs.
-                zip_path = zip_pdfs(entries, here / f"{asm_pn}-drawings.zip")
+                try:
+                    entries = export_assembly_drawings(
+                        client, result, out_dir, workers=args.drawing_workers,
+                        on_progress=progress, force=args.force_export,
+                    )
+                    print()  # clear the \r progress line
+                    # The zip is a one-off snapshot of this run, not part of
+                    # the permanent archive, so it stays in the app folder -
+                    # not in the shared folder alongside everyone's PDFs.
+                    zip_path = zip_pdfs(entries,
+                                        here / f"{safe_filename(asm_pn)}-drawings.zip")
+                except OSError as exc:
+                    # an unreachable share must not cost the audit already done
+                    print(f"    PDF folder unusable: {exc}", file=sys.stderr)
+                    entries, zip_path = [], None
+                    result["errors"].append(f"Drawing PDF export skipped: {exc}")
                 ok, skipped, failed = export_counts(entries)
                 print(f"    {ok} exported, {skipped} already there, {failed} failed"
                      + (f", zipped to {zip_path}" if zip_path else ""))
@@ -931,8 +325,13 @@ def main(argv=None):
 
             if step_dir and result.get("assembly"):
                 print(f"  exporting STEP file to {step_dir} ...")
-                entry = export_assembly_step_file(client, result, Path(step_dir),
-                                                  force=args.force_export)
+                try:
+                    entry = export_assembly_step_file(client, result, Path(step_dir),
+                                                      force=args.force_export)
+                except OSError as exc:
+                    entry = {"pn": asm_pn, "rev": result["assembly"].get("revision"),
+                             "path": None, "error": f"STEP folder unusable: {exc}",
+                             "skipped": False}
                 if entry and entry["error"]:
                     print(f"    failed: {entry['error']}")
                 elif entry and entry.get("skipped"):
@@ -949,9 +348,11 @@ def main(argv=None):
         print("\nInterrupted.", file=sys.stderr)
         return 130
 
-    reused = client.cached_count
-    print(f"\n{client.call_count} API calls"
-          + (f", {reused} repeat lookups answered from memory" if reused else "") + "\n")
+    usage = api_usage(results, client.call_count, client.cached_count, audit_calls)
+    print(f"\n{usage['calls']} API calls (audit {usage['auditCalls']}, "
+          f"exports {usage['exportCalls']})"
+          + (f", {usage['cached']} repeat lookups answered from memory"
+             if usage["cached"] else "") + "\n")
     print("Results")
     print("-" * 60)
     for result in results:
@@ -960,8 +361,7 @@ def main(argv=None):
 
     # One self-contained .html: the page, with the audit data embedded so it
     # can be re-rendered (--render) or read as data later.
-    data = build_report(results, base_url, folder_notes,
-                        api=api_usage(results, client.call_count, client.cached_count))
+    data = build_report(results, base_url, folder_notes, api=usage)
     # revaudit-<stamp>_<assemblies>: the '_' after the stamp is what tells the
     # web UI this is a CLI file with no share token in its name (see serve.py).
     stamp = ("revaudit-" + datetime.now().strftime("%Y%m%d-%H%M%S")

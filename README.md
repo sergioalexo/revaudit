@@ -121,10 +121,14 @@ Plain text, safe to read, opens in Notepad. Restart RevAudit after editing.
 | `port` | Default `8000`. |
 | `[folders]` dxf / sat / pdf / step | Where the production files live. Prefer a UNC path (`\\server\share\...`) over a mapped drive (`K:`) if RevAudit runs at logon — drive letters only exist while you're signed in. |
 | `[folders]` report | Where reports are saved — one `.html` per run with its data embedded, re-rendered by the web UI on every open — so anyone with drive access can browse the audit history. Blank = keep them in the app folder. If the folder is unreachable when a report is written, that one falls back to the app folder. |
+| `[folders]` download_keep_days | How long the web UI keeps each run's download copies (the drawing zip and STEP copy behind its share links) in `drawings\`. Default `90`; `0` keeps them forever. The PDFs and STEP files in the export folders are never deleted. |
 | `[audit]` revision_cache_seconds | How long a revision lookup is reused before Onshape is asked again. Default `600` (ten minutes); `0` asks every time. See [Not burning API calls](#not-burning-api-calls). |
+| `[audit]` part_pattern | Which BOM part numbers get the drawing / revision / DXF / SAT checks. Default `^PRT-`. |
 
 Every value also accepts an environment variable (`REVAUDIT_BIND_HOST`, `REVAUDIT_DXF_DIR`, …)
 and falls back to a built-in default, so an old `.env`-only setup keeps working untouched.
+`REVAUDIT_CONF` points at a different settings file and `REVAUDIT_LOG` at a different log
+— handy for a second, test instance that mustn't write to the live folders or log.
 
 > **"It stopped working for coworkers"** — check `revaudit.conf`'s address against what
 > RevAudit's own window shows on startup. DHCP hands this machine a new IP now and then;
@@ -174,21 +178,51 @@ py -3.13 revaudit.py ASM-12345
 | `--base-url URL` | Onshape URL, if not set in `.env`. |
 | `--company-id ID` | Skip company auto-detection. |
 | `--workers N` | Parallel API lookups, default 6. Lower it if you hit rate limits. |
-| `--no-deep` | Skip the extra element-type sweep on parts that appear to have no drawing. |
+| `--part-pattern REGEX` | Part numbers that get the per-part checks. Default from `[audit] part_pattern`, else `^PRT-`. |
+| `--no-deep` | Leave out what else is released under a part number that has no drawing (free either way). |
 | `-v` | Log every API call. |
 
 ## Not burning API calls
 
-An audit is hundreds of Onshape calls — roughly `2 + 2 × (unique parts)`, more for parts
-that appear to have no drawing — and most of the time it is asked for again long before
-anything it looks at has moved. Two things keep that in check.
+What a run costs, and why:
 
-**Every repeated lookup is answered from memory.** Each check this tool runs is a
-"revisions of this part number" lookup, and the same part number comes up several times
-within one audit and again for every assembly that shares it. Each one is remembered for
+| Step | Calls |
+|---|---|
+| Audit, per assembly | `4 + 1 × (unique parts)` — the assembly's revisions, the released BOM, the workspace BOM, the workspace id (asked once per document, then remembered), and one lookup per part |
+| Each PDF or STEP actually fetched | about 3 — submit the translation, one status check, download |
+| A PDF/STEP already in the folder at its revision | 0 |
+| "Already audited?" check before a web run | 1 per assembly, which the audit then reuses |
+
+Measured on a 64-part assembly: the audit went from 160 calls to 68, and a fresh export
+from ~6.7 calls per file to 3. Every run logs a greppable line to `revaudit.log` —
+`api-calls N (audit A, exports E), C from memory - …` — and stores the same numbers in
+the report's data (`api` block).
+
+**One lookup per part number covers every element type.** Onshape's revision lookup
+takes `elementType=-1` and returns the part's own revisions, its drawing's, and anything
+else released under the number in one response, each record tagged with its type. That
+used to be two requests per part plus three more for every part with no drawing.
+(Checked against the live API: the same records, in the same order, as the per-type
+requests.)
+
+**Every repeated lookup is answered from memory.** The same part number comes up again
+for every assembly that shares it, and the "already audited?" probe asks for the
+assembly before the audit does. Each lookup is remembered for
 `[audit] revision_cache_seconds` (default ten minutes) instead of being asked twice. A
 released revision never changes once it exists, so the only thing this can miss is a
-release made in the last few minutes.
+release made in the last few minutes. BOMs are deliberately *not* remembered: a BOM line's
+`STATE` is the referenced revision's state *now*, so even a released version's BOM changes
+when something it references is obsoleted.
+
+**Translation status is checked about once per file.** A PDF takes Onshape 5–10 seconds,
+a big assembly's STEP minutes. The first status check waits about as long as recent jobs
+of the same kind actually took (the median of the last 25), so most jobs are found
+finished on the first check; after that the waits back off. A job Onshape reports as gone
+(404) fails at once instead of being polled until the timeout.
+
+**Rate limits are respected, not hammered.** A 429 or 503 waits for the `Retry-After` the
+response asks for (capped at two minutes) — and on a 429 *every* worker thread waits, not
+just the one that was told, so the others don't spend calls on more 429s.
 
 **A run that would repeat an existing report offers that report instead.** Before running,
 the web UI asks one question — *what revision is this assembly at?* — and looks for a
@@ -199,7 +233,7 @@ requested from Onshape and you get the choice:
 - **Run the audit again** — spends the calls, and clears the remembered lookups first so
   everything is re-read from Onshape.
 - **Audit only the N not yet covered** — when some of the assemblies you typed are
-  already covered and some aren't.
+  already covered and some aren't. The lookups the check just made are reused.
 
 The card for each assembly says when the existing report was written and which checks it
 covered (`DXF`, `SAT`, drawing PDFs, STEP), and flags anything this run would add that the
@@ -276,13 +310,18 @@ Onshape a revision is only created when a release completes, so the presence of 
 the released state. The `STATE` column in a BOM is not sufficient on its own — it
 describes the revision the BOM happens to reference, not whether a drawing exists.
 
-**Part revisions and drawing revisions are queried separately** (`elementType=0` and
-`elementType=2`). This is what surfaces a part sitting at rev C whose drawing never moved
-past rev B — a mismatch the BOM view will not show you.
+**Part revisions and drawing revisions are compared separately** (`elementType` 0 and 2
+in the one lookup per part). This is what surfaces a part sitting at rev C whose drawing
+never moved past rev B — a mismatch the BOM view will not show you.
 
-**Parts that appear to have no drawing get a second pass** across the other element types
-(assembly, blob, application) before being reported, so a drawing filed unusually isn't
-mistaken for a missing one. Turn this off with `--no-deep`.
+**A part with no drawing says what else is released under its number** — an assembly, a
+blob (a PDF uploaded as a file), … — in an *Also released as* column, so a drawing filed
+unusually isn't mistaken for a missing one. It comes with the part's lookup, so it costs
+nothing; `--no-deep` leaves it out of the report.
+
+**Which BOM lines count as parts** is `[audit] part_pattern` in `revaudit.conf` (default
+`^PRT-`, also `--part-pattern`). Lines that don't match — hardware, purchased items — are
+still checked for their release state, just not for drawings or files.
 
 **DXF matching is case-insensitive with digit boundaries**, so `PRT-12` never matches
 `PRT-123.dxf`. A part is only expected to have a DXF when its material matches
@@ -323,11 +362,15 @@ free dedup. Default location: `REVAUDIT_PDF_DIR` in `.env` / `[folders] pdf` in
 doesn't already exist** - worth knowing before pointing this at a shared drive.
 
 Each drawing that does need fetching costs one Onshape translation round trip (POST a
-translation job at the part's exact released version, poll until done, download the
-result), so this is the slow part of a first run — budget roughly a second per drawing.
-A 68-part assembly takes about a minute and a half with the default worker count the
-first time, and seconds after that. One failed drawing doesn't lose the rest: it's
-reported by itself and everything else still exports.
+translation job at the part's exact released version, check until done, download the
+result) — about three API calls and a few seconds, several running at once. This is the
+slow part of a first run; a re-run only fetches what changed. One failed drawing doesn't
+lose the rest: it's reported by itself and everything else still exports, and an
+unreachable folder is reported on the run rather than costing the audit already done.
+
+**Files are written atomically** — to a temporary name in the same folder, then swapped
+in. A PDF cut short by a dropped connection would otherwise sit in the folder looking
+finished, and be skipped as "already there" on every run after.
 
 Every export is version-scoped to the same revision the audit already resolved, so the
 PDF always matches what was actually checked — never the live workspace.
@@ -381,14 +424,18 @@ the download link, so nobody has to remember this paragraph.
 
 | File | Purpose |
 |---|---|
-| `revaudit.py` | CLI entry point, report renderer (HTML with the audit data embedded) |
-| `serve.py` | Single-user web UI, API key from `.env` |
+| `revaudit.py` | CLI entry point |
+| `serve.py` | Single-user web UI, API key from `.env`, behind the shared password |
 | `oauth_app.py` | Multi-user web app, everyone signs in with their own Onshape account |
-| `import_key.py` | Imports credentials from a text file into `.env` |
+| `webapp.py` | What both web front ends share: the form and pages, file indexes, running an audit + exports, download links |
+| `report.py` | The report: build, render (HTML with the audit data embedded), save, load |
+| `report_store.py` | Report names and folders, recent reports, the "already audited?" lookup |
 | `audit_core.py` | Production-file index and the per-assembly audit |
-| `onshape_client.py` | REST client, BOM and revision helpers |
+| `onshape_client.py` | REST client (retries, rate limits, memoised lookups), BOM and revision helpers |
 | `pdf_export.py` | Drawing PDF and assembly STEP export via Onshape's translation API |
-| `config.py` | Reads `revaudit.conf` — port, address, folder paths |
+| `config.py` | Reads `revaudit.conf` and `.env` — port, address, folder paths |
+| `fsutil.py` | Atomic file writes |
+| `import_key.py` | Imports credentials from a text file into `.env` |
 | `test_audit.py` | Offline tests — mock client, no network or credentials needed |
 | `static/` | CSS/JS for the report and web UI, inlined into the HTML at render time |
 | `dxf_indexer.py` | Publishes a DXF/SAT filename index to a host that cannot see the share |
@@ -410,9 +457,10 @@ py -3.13 test_audit.py
   files on a mapped drive). It happens once per run, not once per assembly.
 - An assembly that has never been released won't be found, since the lookup goes through
   the revision registry. The tool says so rather than failing silently.
-- API calls per assembly are roughly `2 + 2 × (unique parts)`, so ~150 for a 70-part
-  assembly — before the savings in [Not burning API calls](#not-burning-api-calls).
-  Retries with backoff are built in for 429 and 5xx responses.
+- API calls per assembly are `4 + 1 × (unique parts)`, so ~74 for a 70-part assembly,
+  plus about 3 per PDF/STEP that isn't in its folder yet — see
+  [Not burning API calls](#not-burning-api-calls). Retries with backoff are built in for
+  429 and 5xx responses, honouring `Retry-After`.
 
 
 ## Access modes

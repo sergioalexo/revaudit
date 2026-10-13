@@ -9,8 +9,6 @@ from pathlib import Path
 
 from onshape_client import (
     ET_ASSEMBLY,
-    ET_BLOB,
-    ET_APPLICATION,
     ET_DRAWING,
     ET_NAMES,
     ET_PARTSTUDIO,
@@ -18,9 +16,15 @@ from onshape_client import (
     current_revision,
     drawing_ids,
     normalize_bom,
+    number,
     rev_lt,
     view_url,
 )
+
+# BOM lines whose part number matches this get the per-part checks (drawing,
+# revision, DXF/SAT). Everything else - hardware, purchased items - is only
+# checked for its release state. revaudit.conf [audit] part_pattern overrides.
+DEFAULT_PART_PATTERN = r"^PRT-"
 
 
 # --------------------------------------------------------------------------
@@ -95,13 +99,15 @@ DxfIndex = FileIndex
 # --------------------------------------------------------------------------
 
 def resolve_assembly(client, company_id, part_number):
-    """Locate the released assembly revision for a part number."""
-    revs = client.revisions(company_id, part_number, ET_ASSEMBLY)
+    """Locate the released assembly revision for a part number. One revision
+    lookup covers the assembly and its drawing."""
+    sets = client.revision_sets(company_id, part_number)
+    revs = sets.get(ET_ASSEMBLY, [])
     if not revs:
         return None
     current = current_revision(revs)
     chosen = current or revs[0]
-    drawings = client.revisions(company_id, part_number, ET_DRAWING)
+    drawings = sets.get(ET_DRAWING, [])
     drawing_current = current_revision(drawings)
     return {
         "partNumber": part_number,
@@ -127,10 +133,23 @@ def resolve_assembly(client, company_id, part_number):
     }
 
 
+def other_elements(sets):
+    """{element type name: revision count} for whatever else is released
+    under a part number besides the part itself and a drawing - an assembly,
+    a blob (a PDF drawing uploaded as a file), ... The hint that a "missing"
+    drawing was really filed some other way."""
+    return {ET_NAMES.get(et, f"type {et}"): len(items)
+            for et, items in sorted(sets.items(), key=lambda kv: str(kv[0]))
+            if et not in (ET_PARTSTUDIO, ET_DRAWING) and items}
+
+
 def part_status(client, company_id, part_number):
-    """Current part revision and current drawing revision for one part number."""
-    part_revs = client.revisions(company_id, part_number, ET_PARTSTUDIO)
-    drawing_revs = client.revisions(company_id, part_number, ET_DRAWING)
+    """Current part revision and current drawing revision for one part
+    number - one revision lookup, which also says what else is released
+    under the number."""
+    sets = client.revision_sets(company_id, part_number)
+    part_revs = sets.get(ET_PARTSTUDIO, [])
+    drawing_revs = sets.get(ET_DRAWING, [])
     part_cur = current_revision(part_revs)
     drawing_cur = current_revision(drawing_revs)
     return {
@@ -146,17 +165,8 @@ def part_status(client, company_id, part_number):
         # Onshape links to the current part revision and drawing revision
         "partUrl": view_url(part_cur),
         "drawingUrl": view_url(drawing_cur),
+        "otherElements": other_elements(sets),
     }
-
-
-def deep_check_no_drawing(client, company_id, part_number):
-    """Confirm a part truly has no drawing by sweeping the other element types."""
-    found = {}
-    for et in (ET_ASSEMBLY, ET_BLOB, ET_APPLICATION):
-        items = client.revisions(company_id, part_number, et)
-        if items:
-            found[ET_NAMES[et]] = len(items)
-    return found
 
 
 def bom_signature(rows):
@@ -168,12 +178,18 @@ def bom_signature(rows):
 # --------------------------------------------------------------------------
 
 def audit_assembly(client, company_id, asm_pn, file_checks=None,
-                   workers=6, deep=True, verbose=False):
+                   workers=6, deep=True, verbose=False, part_pattern=DEFAULT_PART_PATTERN):
     """Run every check for one assembly part number.
 
     file_checks is a list of {"name", "material_regex", "index"} dicts, one
     per production-file type to audit (DXF, SAT, ...). "index" is a FileIndex
     or None to skip that check. Order is preserved into the report.
+
+    API cost: one revision lookup for the assembly, one per unique part (the
+    client remembers them, so a repeat is free), the released BOM, and the
+    workspace BOM for the drift check (plus the workspace id, once per
+    document). deep only decides whether a part with no drawing lists what
+    else is released under its number - that comes free with its lookup.
     """
     file_checks = file_checks or []
     result = {"partNumber": asm_pn, "errors": [], "findings": {}}
@@ -204,8 +220,7 @@ def audit_assembly(client, company_id, asm_pn, file_checks=None,
 
     # -- workspace drift -------------------------------------------------
     try:
-        doc = client.document(asm["documentId"]) or {}
-        wsid = (doc.get("defaultWorkspace") or {}).get("id")
+        wsid = client.default_workspace(asm["documentId"])
         if wsid:
             ws_rows = normalize_bom(
                 client.bom(asm["documentId"], "w", wsid, asm["elementId"],
@@ -229,7 +244,8 @@ def audit_assembly(client, company_id, asm_pn, file_checks=None,
     # -- duplicate part numbers ------------------------------------------
     grouped = {}
     for row in rows:
-        grouped.setdefault(row["pn"], []).append(row)
+        if row["pn"]:                 # lines with no part number aren't one part
+            grouped.setdefault(row["pn"], []).append(row)
     duplicates = []
     for pn, lines in grouped.items():
         if len(lines) < 2:
@@ -268,7 +284,9 @@ def audit_assembly(client, company_id, asm_pn, file_checks=None,
     ]
 
     # -- per-part drawing status -------------------------------------------
-    part_rows = [r for r in rows if r["pn"] and re.match(r"^PRT-", str(r["pn"]), re.I)]
+    part_re = (part_pattern if hasattr(part_pattern, "search")
+               else re.compile(part_pattern or DEFAULT_PART_PATTERN, re.IGNORECASE))
+    part_rows = [r for r in rows if r["pn"] and part_re.search(str(r["pn"]))]
     unique_pns = sorted({r["pn"] for r in part_rows})
 
     bom_rev_by_pn = {}
@@ -279,7 +297,7 @@ def audit_assembly(client, company_id, asm_pn, file_checks=None,
         bom_rev_by_pn.setdefault(r["pn"], set()).add(str(r["rev"]) if r["rev"] else None)
         material_by_pn.setdefault(r["pn"], r["material"])
         name_by_pn.setdefault(r["pn"], r["name"])
-        qty_by_pn[r["pn"]] = qty_by_pn.get(r["pn"], 0) + (r["qty"] or 0)
+        qty_by_pn[r["pn"]] = qty_by_pn.get(r["pn"], 0) + number(r["qty"])
 
     statuses = {}
     if unique_pns:
@@ -316,7 +334,7 @@ def audit_assembly(client, company_id, asm_pn, file_checks=None,
         }
         if not st["drawingRev"]:
             if deep:
-                entry["otherElements"] = deep_check_no_drawing(client, company_id, pn)
+                entry["otherElements"] = st.get("otherElements") or {}
             no_drawing.append(entry)
         elif st["partRev"] and rev_lt(st["drawingRev"], st["partRev"]):
             behind.append(entry)
@@ -325,7 +343,7 @@ def audit_assembly(client, company_id, asm_pn, file_checks=None,
         if st["partRev"] and bom_revs and st["partRev"] not in bom_revs:
             stale.append({**entry, "bomRevs": sorted(x for x in bom_revs if x)})
 
-    result["findings"]["noDrawing"] = sorted(no_drawing, key=lambda e: -(e["qty"] or 0))
+    result["findings"]["noDrawing"] = sorted(no_drawing, key=lambda e: -number(e["qty"]))
     result["findings"]["drawingBehindPart"] = behind
     result["findings"]["bomRevStale"] = stale
 

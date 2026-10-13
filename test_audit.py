@@ -4,18 +4,22 @@
 """
 
 import json
+import os
 import re
 import sys
 import tempfile
+import time
 from html import unescape
 from pathlib import Path
 
+import report_store
+import webapp
 from audit_core import audit_assembly
 from pdf_export import (_collect_jobs, export_assembly_drawings,
                         export_assembly_step_file, export_counts, safe_filename)
 from onshape_client import OnshapeClient, OnshapeError, normalize_bom, rev_lt
-from revaudit import (build_report, extract_data, load_report, render_data,
-                      report_name_part, save_report)
+from report import (build_report, extract_data, load_report, render_data,
+                    report_name_part, save_report)
 
 # --------------------------------------------------------------------------
 # a mock Onshape backend shaped exactly like the real payloads
@@ -89,13 +93,31 @@ DRAWING_REVS = {
 
 
 class MockClient:
+    """Answers the way OnshapeClient does: revision_sets() is one lookup per
+    part number covering every element type."""
+
     def __init__(self, drift=False):
         self.drift = drift
         self.call_count = 0
+        self.lookups = []
         self.bom_configurations = []
 
-    def revisions(self, cid, pn, element_type):
+    def revision_sets(self, cid, pn):
         self.call_count += 1
+        self.lookups.append(pn)
+        sets = {et: self._revisions(pn, et) for et in (0, 1, 2, 4)}
+        return {et: items for et, items in sets.items() if items}
+
+    def revisions(self, cid, pn, element_type):
+        return self.revision_sets(cid, pn).get(element_type, [])
+
+    def usage(self):
+        return self.call_count, 0
+
+    def _revisions(self, pn, element_type):
+        if pn == "PRT-104" and element_type == 4:
+            # the "missing" drawing was uploaded as a PDF blob instead
+            return [{"revision": "A", "isObsolete": False}]
         if pn == "ASM-TEST" and element_type == 1:
             return [{"documentId": "D", "documentName": "TESTDOC", "elementId": "E",
                      "versionId": "V", "revision": "A", "isObsolete": False,
@@ -124,8 +146,8 @@ class MockClient:
     def forget_revisions(self):
         pass                       # nothing is remembered here to forget
 
-    def document(self, did):
-        return {"defaultWorkspace": {"id": "W"}}
+    def default_workspace(self, did):
+        return "W"
 
     def bom(self, did, wv, wvid, eid, configuration=None):
         # the audit must ask for the released configuration, otherwise parts
@@ -198,6 +220,20 @@ def main():
     res = audit_assembly(client, "CID", "ASM-TEST", file_checks, workers=4, deep=False)
     f = res["findings"]
 
+    check("one revision lookup for the assembly + one per unique part",
+          (client.call_count, sorted(client.lookups)),
+          (9, sorted(["ASM-TEST"] + [f"PRT-10{i}" for i in range(8)])))
+    check("deep=False leaves out what else is released", "otherElements" in f["noDrawing"][0],
+          False)
+    deep_client = MockClient()
+    deep_res = audit_assembly(deep_client, "CID", "ASM-TEST", file_checks, workers=4, deep=True)
+    check("deep check costs no extra lookups", deep_client.call_count, 9)
+    check("no-drawing part says its drawing went in as a blob",
+          deep_res["findings"]["noDrawing"][0]["otherElements"], {"blob": 1})
+    deep_page = render_data(build_report([deep_res], "https://cad.example"))
+    check("report shows where the drawing went", "Also released as" in deep_page
+          and "blob &times;1" in deep_page, True)
+
     check("assembly rev", res["assembly"]["revision"], "A")
     check("bom lines", len(res["rows"]), 10)
     check("state counts", res["stateCounts"],
@@ -245,7 +281,7 @@ def main():
 
     print("\nsafe_filename")
     check("strips illegal chars", safe_filename('PRT-1/2:3*4?"5<6>7|8'), "PRT-1_2_3_4_5_6_7_8")
-    check("plain part number untouched", safe_filename("PRT-13417"), "PRT-13417")
+    check("plain part number untouched", safe_filename("PRT-12345"), "PRT-12345")
     check("all-illegal input becomes one underscore", safe_filename("///"), "_")
     check("empty input falls back to 'file'", safe_filename(""), "file")
 
@@ -406,134 +442,174 @@ def main():
           "ASM-1+ASM-2+ASM-3+2more")
     check("filename-unsafe and '_' become '.'", report_name_part(["A/B_C:D"]), "A.B.C.D")
     check("empty list", report_name_part([]), "audit")
-    import serve
     shared_ok = ["revaudit-20260921-083310-ASM-10001-3lCz5WsDO8K1yQza",
                  "revaudit-20260921-083310-ASM-1+ASM-2+2more-3lCz5WsDO8K1yQza.json",
                  "revaudit-20260918-152706-G88H_djHZ-rV4psI.html"]      # pre-name format
-    check("shared names match", [bool(re.fullmatch(serve.SHARED_REPORT_RE, n))
+    check("shared names match", [bool(re.fullmatch(report_store.SHARED_REPORT_RE, n))
                                  for n in shared_ok], [True] * 3)
     legacy_ok = ["revaudit-20260921-083310_ASM-10001.json", "revaudit-20260918-152706.html",
                  "revaudit-20260921-083310_PRT-1234+PRT-5678+ASM-9"]
     check("CLI names never pass as shared",
-          [bool(re.fullmatch(serve.SHARED_REPORT_RE, n)) for n in legacy_ok], [False] * 3)
+          [bool(re.fullmatch(report_store.SHARED_REPORT_RE, n)) for n in legacy_ok], [False] * 3)
     check("CLI names are legacy (password-gated)",
-          [bool(re.fullmatch(serve.LEGACY_REPORT_RE, n)) for n in legacy_ok], [True] * 3)
-    check("new web id shape", bool(re.fullmatch(serve.SHARED_REPORT_RE,
-                                                serve.new_report_id(["ASM-10001"]))), True)
+          [bool(re.fullmatch(report_store.LEGACY_REPORT_RE, n)) for n in legacy_ok], [True] * 3)
+    check("new web id shape", bool(re.fullmatch(report_store.SHARED_REPORT_RE,
+                                                report_store.new_report_id(["ASM-10001"]))), True)
     check("label shows assemblies + time",
-          serve.report_label("revaudit-20260921-083310-ASM-10001+ASM-10002-3lCz5WsDO8K1yQza.json"),
+          report_store.report_label("revaudit-20260921-083310-ASM-10001+ASM-10002-3lCz5WsDO8K1yQza.json"),
           "ASM-10001 + ASM-10002 \u00b7 2026-09-21 08:33")
-    check("label for CLI name", serve.report_label("revaudit-20260921-083310_ASM-10001.html"),
+    check("label for CLI name", report_store.report_label("revaudit-20260921-083310_ASM-10001.html"),
           "ASM-10001 \u00b7 2026-09-21 08:33")
     check("label for old tokened name",
-          serve.report_label("revaudit-20260918-152706-G88H_djHZ-rV4psI.html"),
+          report_store.report_label("revaudit-20260918-152706-G88H_djHZ-rV4psI.html"),
           "2026-09-18 15:27")
 
     print("\nrevision lookups are remembered instead of re-asked")
 
     class CountingClient(OnshapeClient):
         """A real client with the network taken out, so the memo around
-        revisions() is what is actually under test."""
+        revision_sets() is what is actually under test. Answers like the real
+        elementType=-1 lookup: every type at once, each record typed."""
 
-        def __init__(self, **kw):
+        def __init__(self, items=None, pages=None, **kw):
             super().__init__("https://cad.example", "a", "b", **kw)
-            self.gets = 0
+            self.gets = []
+            self.items = items if items is not None else [
+                {"elementType": 2, "revision": "B", "isObsolete": False},
+                {"elementType": 0, "revision": "B", "isObsolete": False},
+                {"elementType": 0, "revision": "A", "isObsolete": True},
+            ]
+            self.pages = pages or {}
 
         def get(self, path, params=None, retries=4):
-            self.gets += 1
-            return {"items": [{"revision": "A", "isObsolete": False}]}
+            self.gets.append((path, dict(params or {})))
+            if path in self.pages:
+                return self.pages[path]
+            return {"items": [dict(i) for i in self.items]}
 
     memo = CountingClient(revision_cache_seconds=600)
+    sets = memo.revision_sets("CID", "PRT-1")
+    check("one request asks for every element type", memo.gets[0][1], {"elementType": -1})
+    check("records are grouped by element type",
+          {et: [i["revision"] for i in items] for et, items in sets.items()},
+          {0: ["B", "A"], 2: ["B"]})
     memo.revisions("CID", "PRT-1", 0)
-    memo.revisions("CID", "PRT-1", 0)
-    memo.revisions("CID", "PRT-1", 2)        # different element type -> its own entry
+    memo.revisions("CID", "PRT-1", 2)        # another type of the same number: no call
     memo.revisions("CID", "PRT-2", 0)
-    check("repeat lookup costs no call", memo.gets, 3)
-    check("repeats are counted", memo.cached_count, 1)
+    check("repeat lookups cost no call", len(memo.gets), 2)
+    check("repeats are counted", memo.cached_count, 2)
     memo.revisions("CID", "PRT-1", 0)[0]["revision"] = "MUTATED"
     check("callers cannot corrupt the memo",
-          memo.revisions("CID", "PRT-1", 0)[0]["revision"], "A")
+          memo.revisions("CID", "PRT-1", 0)[0]["revision"], "B")
     memo.forget_revisions()
     memo.revisions("CID", "PRT-1", 0)
-    check("forget_revisions re-asks", memo.gets, 4)
+    check("forget_revisions re-asks", len(memo.gets), 3)
     off = CountingClient(revision_cache_seconds=0)
     off.revisions("CID", "PRT-1", 0)
     off.revisions("CID", "PRT-1", 0)
-    check("0 seconds turns it off", off.gets, 2)
+    check("0 seconds turns it off", len(off.gets), 2)
+
+    untyped = CountingClient(items=[{"revision": "A", "isObsolete": False}],
+                             revision_cache_seconds=0)
+    untyped_sets = untyped.revision_sets("CID", "PRT-1")
+    check("records without a type fall back to asking per type",
+          [p["elementType"] for _, p in untyped.gets], [-1, 0, 1, 2, 4])
+    check("per-type fallback still answers", untyped_sets[0][0]["revision"], "A")
+
+    paged = CountingClient(revision_cache_seconds=0, pages={
+        "/api/v6/revisions/companies/CID/partnumber/PRT-9": {
+            "items": [{"elementType": 0, "revision": "B", "isObsolete": False}],
+            "next": "https://cad.example/api/v6/revisions/companies/CID/partnumber/PRT-9?offset=1"},
+        "https://cad.example/api/v6/revisions/companies/CID/partnumber/PRT-9?offset=1": {
+            "items": [{"elementType": 0, "revision": "A", "isObsolete": True}]},
+    })
+    check("a 'next' page is followed",
+          [i["revision"] for i in paged.revision_sets("CID", "PRT-9")[0]], ["B", "A"])
+    try:
+        memo._url("https://evil.example/api/v6/x")
+        check("a link to another host is refused", False, True)
+    except OnshapeError:
+        check("a link to another host is refused", True, True)
+
+    ws = CountingClient(revision_cache_seconds=0)
+    ws.get = lambda path, params=None, retries=4: (
+        ws.gets.append(path) or {"defaultWorkspace": {"id": "W1"}})
+    ws.default_workspace("D1")
+    ws.default_workspace("D1")
+    check("a document's workspace id is asked for once", ws.gets, ["/api/v6/documents/D1"])
 
     print("\nalready-audited check")
-    import serve
 
     check("id carries its assemblies",
-          serve.report_pn_parts("revaudit-20260921-083310-ASM-1+ASM-2-3lCz5WsDO8K1yQza"),
+          report_store.report_pn_parts("revaudit-20260921-083310-ASM-1+ASM-2-3lCz5WsDO8K1yQza"),
           (["ASM-1", "ASM-2"], False))
     check("'+2more' means some were left out",
-          serve.report_pn_parts("revaudit-20260921-083310-ASM-1+2more-3lCz5WsDO8K1yQza"),
+          report_store.report_pn_parts("revaudit-20260921-083310-ASM-1+2more-3lCz5WsDO8K1yQza"),
           (["ASM-1"], True))
     check("a nameless id could cover anything",
-          serve.report_pn_parts("revaudit-20260918-152706-G88H_djHZ-rV4psI"),
+          report_store.report_pn_parts("revaudit-20260918-152706-G88H_djHZ-rV4psI"),
           ([], True))
     check("CLI name carries its assemblies",
-          serve.report_pn_parts("revaudit-20260921-083310_ASM-10001"),
+          report_store.report_pn_parts("revaudit-20260921-083310_ASM-10001"),
           (["ASM-10001"], False))
     check("named report only matches its own",
-          [serve.report_may_cover("revaudit-20260921-083310-ASM-1-3lCz5WsDO8K1yQza", f)
+          [report_store.report_may_cover("revaudit-20260921-083310-ASM-1-3lCz5WsDO8K1yQza", f)
            for f in ("ASM-1", "ASM-2")], [True, False])
     check("truncated report is always a candidate",
-          serve.report_may_cover("revaudit-20260921-083310-ASM-1+2more-3lCz5WsDO8K1yQza",
+          report_store.report_may_cover("revaudit-20260921-083310-ASM-1+2more-3lCz5WsDO8K1yQza",
                                  "ASM-9"), True)
 
     with tempfile.TemporaryDirectory() as tmp:
         reports = Path(tmp)
-        original_dirs = serve.report_dirs
-        serve.report_dirs = lambda: [reports]
+        original_dirs = report_store.report_dirs
+        report_store.report_dirs = lambda: [reports]
         try:
-            rid = serve.new_report_id(["ASM-TEST"])
+            rid = report_store.new_report_id(["ASM-TEST"])
             save_report(reports / f"{rid}.html",
                         build_report([res], "https://cad.example"))
 
-            coverage = serve.report_coverage(reports / f"{rid}.html")
+            coverage = report_store.report_coverage(reports / f"{rid}.html")
             check("coverage names the audited revision",
                   coverage["ASM-TEST"]["revision"], "A")
             check("coverage lists the file checks it ran",
                   sorted(coverage["ASM-TEST"]["checks"]), ["DXF", "SAT"])
 
-            hit = serve.find_prior_report("ASM-TEST", "A")
+            hit = report_store.find_prior_report("ASM-TEST", "A")
             check("finds the report for this revision", hit and hit["id"], rid)
             check("a different revision is not covered",
-                  serve.find_prior_report("ASM-TEST", "B"), None)
+                  report_store.find_prior_report("ASM-TEST", "B"), None)
             check("another assembly is not covered",
-                  serve.find_prior_report("ASM-OTHER", "A"), None)
+                  report_store.find_prior_report("ASM-OTHER", "A"), None)
             check("no revision -> no shortcut",
-                  serve.find_prior_report("ASM-TEST", None), None)
+                  report_store.find_prior_report("ASM-TEST", None), None)
             check("a report the user may not open is not offered",
-                  serve.find_prior_report("ASM-TEST", "A", allowed_ids=[]), None)
+                  report_store.find_prior_report("ASM-TEST", "A", allowed_ids=[]), None)
             check("their own report is offered",
-                  bool(serve.find_prior_report("ASM-TEST", "A", allowed_ids=[rid])), True)
+                  bool(report_store.find_prior_report("ASM-TEST", "A", allowed_ids=[rid])), True)
 
             # an assembly that never resolved covers nothing - re-running it
             # is the only way to get an answer
-            failed_id = serve.new_report_id(["ASM-NOPE"])
+            failed_id = report_store.new_report_id(["ASM-NOPE"])
             save_report(reports / f"{failed_id}.html", build_report(
                 [{"partNumber": "ASM-NOPE", "errors": ["nope"], "findings": {}}],
                 "https://cad.example"))
             check("a failed audit covers nothing",
-                  serve.find_prior_report("ASM-NOPE", "A"), None)
+                  report_store.find_prior_report("ASM-NOPE", "A"), None)
 
             print("\nthe run/re-run prompt")
             asm_client = MockClient()
-            entries = serve.prior_runs(asm_client, "CID", ["ASM-TEST", "ASM-NOPE"])
+            entries = report_store.prior_runs(asm_client, "CID", ["ASM-TEST", "ASM-NOPE"])
             check("one revision lookup per assembly", asm_client.call_count, 2)
             check("covered assembly is matched to its report",
                   entries[0]["prior"]["id"], rid)
             check("uncovered assembly has no prior", entries[1]["prior"], None)
 
-            values = serve.parse_run_form({
+            values = webapp.parse_run_form({
                 "assemblies": ["ASM-TEST ASM-NOPE"], "dxf_dir": ["DXFDIR"],
                 "dxf_recursive": ["on"], "export_drawings": ["on"],
                 "pdf_dir": ["PDFDIR"],
             })
-            prompt = serve.already_run_page(values, entries).decode("utf-8")
+            prompt = webapp.already_run_page(values, entries).decode("utf-8")
             check("prompt offers the existing report", f"/report/{rid}" in prompt, True)
             check("prompt offers a re-run", "Run the audit again" in prompt, True)
             check("prompt offers just the uncovered one",
@@ -545,16 +621,24 @@ def main():
             # the prompt's buttons must re-post the same audit, unchanged
             hidden = dict(re.findall(
                 r"<input type='hidden' name='([^']+)' value='([^']*)'>",
-                serve.hidden_fields_html(values, force_run="1")))
-            reposted = serve.parse_run_form(
+                webapp.hidden_fields_html(values, force_run="1", fresh="1")))
+            reposted = webapp.parse_run_form(
                 {k: [unescape(v)] for k, v in hidden.items()})
+            flags = ("force_run", "fresh")
             check("re-post keeps every setting",
-                  {k: reposted[k] for k in values if k != "force_run"},
-                  {k: v for k, v in values.items() if k != "force_run"})
-            check("re-post is forced", reposted["force_run"], True)
-            check("the plain form is not forced", values["force_run"], False)
+                  {k: reposted[k] for k in values if k not in flags},
+                  {k: v for k, v in values.items() if k not in flags})
+            check("re-post is forced and fresh", (reposted["force_run"], reposted["fresh"]),
+                  (True, True))
+            check("the plain form is neither", (values["force_run"], values["fresh"]),
+                  (False, False))
+            check("'Run the audit again' re-reads everything",
+                  "name='fresh' value='1'" in prompt.split("Run the audit again")[0], True)
+            only_new_form = prompt.split("Run the audit again")[1]
+            check("'Audit only the N not yet covered' reuses the lookups just made",
+                  "name='fresh'" in only_new_form, False)
         finally:
-            serve.report_dirs = original_dirs
+            report_store.report_dirs = original_dirs
 
     print("\naudit_assembly with a drifted workspace")
     res2 = audit_assembly(MockClient(drift=True), "CID", "ASM-TEST", [], workers=4,
@@ -566,6 +650,192 @@ def main():
     res3 = audit_assembly(MockClient(), "CID", "ASM-NOPE", [], workers=2, deep=False)
     check("reports not found", bool(res3["errors"]), True)
     check("no crash", res3.get("assembly"), None)
+
+    print("\nhardening")
+    import io
+    import urllib.error
+    import onshape_client
+    import pdf_export
+    from fsutil import write_atomic
+    from report import qty
+
+    blank = {"headers": VERSION_BOM["headers"], "rows": [
+        bom_row(1, None, "CABLE TIE", None, "IN PROGRESS", 4, ""),
+        bom_row(2, None, "LABEL", None, "IN PROGRESS", 2, ""),
+    ]}
+
+    class BlankPnClient(MockClient):
+        def bom(self, *a, **k):
+            return blank
+
+    res_blank = audit_assembly(BlankPnClient(), "CID", "ASM-TEST", [], workers=2)
+    check("lines without a part number are not 'duplicates'",
+          res_blank["findings"]["duplicatePartNumbers"], [])
+    check("quantities read as people write them", (qty(6.0), qty(2.5), qty("3"), qty(None)),
+          ("6", "2.5", "3", ""))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "PRT-1_RevA.pdf"
+        target.write_bytes(b"old")
+        try:
+            original_replace = os.replace
+            os.replace = lambda *a: (_ for _ in ()).throw(OSError("share dropped"))
+            write_atomic(target, b"new and complete")
+        except OSError:
+            pass
+        finally:
+            os.replace = original_replace
+        check("an interrupted write leaves the old file whole", target.read_bytes(), b"old")
+        check("and no half-written temp file behind", sorted(p.name for p in Path(tmp).iterdir()),
+              ["PRT-1_RevA.pdf"])
+        write_atomic(target, b"new")
+        check("a finished write replaces it", target.read_bytes(), b"new")
+        entry = pdf_export._fetch_to(Path(tmp) / "missing" / "x.pdf", lambda: b"x",
+                                     {"pn": "PRT-1"}, False)
+        check("an unwritable folder is an entry error, not a crash",
+              (entry["path"], entry["error"].startswith("could not save")), (None, True))
+
+    plan = pdf_export.PollPlan(first=6, then=(3, 5), timeout=60, low=2, high=20)
+    check("first poll waits the default until something is measured", plan.first_wait(), 6)
+    for seconds in (9, 10, 11):
+        plan.record(seconds)
+    check("then about as long as recent jobs took", plan.first_wait(), 10)
+    plan.record(500)
+    check("one slow job doesn't drag the first wait out", plan.first_wait(), 11)
+    waits = plan.waits()
+    check("then backs off and keeps the last wait",
+          [next(waits) for _ in range(5)], [11, 3, 5, 5, 5])
+
+    class FakeTranslator:
+        def __init__(self, states):
+            self.states = list(states)
+            self.calls = []
+
+        def post(self, path, body):
+            self.calls.append("POST")
+            return {"id": "T1", "requestState": "ACTIVE"}
+
+        def get(self, path, params=None):
+            self.calls.append("GET")
+            return self.states.pop(0)
+
+        def get_bytes(self, path):
+            self.calls.append("DOWNLOAD")
+            return b"%PDF"
+
+    instant = pdf_export.PollPlan(first=0, then=(0,), timeout=5, low=0, high=0)
+    done = {"requestState": "DONE", "resultExternalDataIds": ["X"]}
+    tr = FakeTranslator([{"requestState": "ACTIVE"}, done])
+    pdf_export.translate_element(tr, "drawings", "D", "V", "E", "PDF", plan=instant)
+    check("a translation costs POST + polls + download",
+          tr.calls, ["POST", "GET", "GET", "DOWNLOAD"])
+    gone = FakeTranslator([None])
+    try:
+        pdf_export.translate_element(gone, "drawings", "D", "V", "E", "PDF", plan=instant)
+        check("a vanished job fails at once", False, True)
+    except OnshapeError:
+        check("a vanished job fails at once (no polling to the timeout)", gone.calls,
+              ["POST", "GET"])
+
+    check("Retry-After in seconds", onshape_client.retry_after_seconds({"Retry-After": "7"}), 7.0)
+    check("Retry-After is capped", onshape_client.retry_after_seconds({"Retry-After": "9999"}),
+          float(onshape_client.MAX_RETRY_AFTER))
+    check("no Retry-After", onshape_client.retry_after_seconds({}), None)
+    check("Retry-After as a date",
+          round(onshape_client.retry_after_seconds(
+              {"Retry-After": "Wed, 21 Oct 2026 07:28:30 GMT"},
+              now=onshape_client.datetime(2026, 10, 21, 7, 28, 0,
+                                          tzinfo=onshape_client.timezone.utc))), 30)
+
+    attempts = []
+
+    def fake_urlopen(req, timeout=None):
+        attempts.append(req.full_url)
+        if len(attempts) == 1:
+            raise urllib.error.HTTPError(req.full_url, 429, "slow down",
+                                         {"Retry-After": "0"}, io.BytesIO(b""))
+        return io.BytesIO(b'{"ok": true}')
+
+    real_urlopen = onshape_client.urllib.request.urlopen
+    onshape_client.urllib.request.urlopen = fake_urlopen
+    try:
+        rate = OnshapeClient("https://cad.example", "a", "b")
+        got = rate.get("/api/v6/x")
+    finally:
+        onshape_client.urllib.request.urlopen = real_urlopen
+    check("a 429 is retried after the wait it asked for", (got, len(attempts)),
+          ({"ok": True}, 2))
+    check("both attempts are counted", rate.call_count, 2)
+
+    for bad in ("../../evil", "SAT/../../x", "nope"):
+        try:
+            webapp.store_uploaded_index(json.dumps({"name": bad, "names": []}).encode(), False)
+            check(f"index name {bad!r} refused", False, True)
+        except ValueError:
+            check(f"index name {bad!r} refused", True, True)
+
+    check("download names always match the link pattern",
+          bool(re.fullmatch(webapp.SHARED_ZIP_RE, webapp.new_zip_name("ASM 12.3/A"))), True)
+    check("assembly list: split, in order, once each",
+          webapp.assembly_names({"assemblies": "ASM-2, ASM-1;ASM-2  ASM-3"}),
+          ["ASM-2", "ASM-1", "ASM-3"])
+    bad_form = webapp.parse_run_form({"assemblies": ["ASM-1"], "dxf_material_regex": ["SHE(ET"]})
+    check("a broken material pattern is caught before any API call",
+          "not valid" in (webapp.form_error(bad_form) or ""), True)
+    check("an empty form is caught too",
+          webapp.form_error(webapp.parse_run_form({})), "Enter at least one assembly number.")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        original_dir = webapp.DRAWINGS_DIR
+        webapp.DRAWINGS_DIR = Path(tmp)
+        try:
+            old_zip = Path(tmp) / webapp.new_zip_name("ASM-1")
+            new_zip = Path(tmp) / webapp.new_zip_name("ASM-2")
+            other = Path(tmp) / "keep-me.zip"
+            for p in (old_zip, new_zip, other):
+                p.write_bytes(b"x")
+            ancient = time.time() - 200 * 86400
+            os.utime(old_zip, (ancient, ancient))
+            os.utime(other, (ancient, ancient))
+            removed = webapp.prune_downloads(keep_days=90)
+            check("old download copies are pruned, nothing else",
+                  (removed, sorted(p.name for p in Path(tmp).iterdir())),
+                  (1, sorted([new_zip.name, other.name])))
+            check("keep_days 0 keeps everything", webapp.prune_downloads(keep_days=0), 0)
+        finally:
+            webapp.DRAWINGS_DIR = original_dir
+
+    class Sink:
+        def __init__(self):
+            self.status = None
+
+        def _send(self, body, status=200, ctype=None):
+            self.status = status
+
+    sink = Sink()
+    webapp.send_download(sink, "..%2f..%2frevaudit.conf")
+    check("a download outside the link pattern is a 404", sink.status, 404)
+
+    quiet = webapp.QuietServer.__new__(webapp.QuietServer)
+    printed = io.StringIO()
+    real_stderr = sys.stderr
+    sys.stderr = printed
+    try:
+        try:
+            raise ConnectionResetError(10054, "forcibly closed")
+        except ConnectionResetError:
+            quiet.handle_error(None, ("127.0.0.1", 1))
+    finally:
+        sys.stderr = real_stderr
+    check("a client hanging up is not logged as a crash", printed.getvalue(), "")
+
+    tricky = json.loads(json.dumps(res))
+    tricky["rows"][0]["name"] = "<!--<script>x</script>"
+    tricky_page = render_data(build_report([tricky], "https://cad.example"))
+    check("'<!--' inside data can't bend the page",
+          ("<!--" in tricky_page.split('id="revaudit-data">')[1],
+           extract_data(tricky_page)["results"][0]["rows"][0]["name"]),
+          (False, "<!--<script>x</script>"))
 
     print("\nCSS/JS moved to static/")
     static = Path(__file__).resolve().parent / "static"

@@ -12,3 +12,4 @@ file-index-*.json
 drawings/
 revaudit.conf
 banner*.txt
+*-drawings.zip
