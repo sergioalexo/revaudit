@@ -23,8 +23,14 @@ def safe_filename(text):
     return cleaned or "file"
 
 
+# Seconds to wait before each status poll; the last value repeats. A drawing
+# usually takes 5-10s, so a fixed 2s poll spent ~5 calls per file just asking
+# "done yet?". Starting later and backing off needs about 2-3.
+POLL_SCHEDULE = (4, 4, 6, 8, 10)
+
+
 def translate_element(client, kind, document_id, version_id, element_id, format_name,
-                      extra_body=None, poll_seconds=2, timeout=180):
+                      extra_body=None, poll_schedule=POLL_SCHEDULE, timeout=180):
     """Translate one Onshape element, at one immutable version, to another
     format. Returns the downloaded file's raw bytes.
 
@@ -42,7 +48,10 @@ def translate_element(client, kind, document_id, version_id, element_id, format_
         raise OnshapeError(f"translation did not return a job id: {job}")
 
     deadline = time.time() + timeout
+    polls = 0
     while True:
+        time.sleep(poll_schedule[min(polls, len(poll_schedule) - 1)])
+        polls += 1
         status = client.get(f"/api/v6/translations/{job_id}") or {}
         state = status.get("requestState")
         if state == "DONE":
@@ -54,7 +63,6 @@ def translate_element(client, kind, document_id, version_id, element_id, format_
             raise OnshapeError(status.get("failureReason") or "translation failed")
         if time.time() > deadline:
             raise OnshapeError(f"translation timed out after {timeout}s")
-        time.sleep(poll_seconds)
 
 
 def export_pdf(client, document_id, version_id, element_id, **kw):
