@@ -36,6 +36,7 @@ from audit_core import FileIndex, audit_assembly
 from onshape_client import DEFAULT_BASE_URL, OnshapeClient, OnshapeError
 from pdf_export import (export_assembly_drawings, export_assembly_step_file,
                         export_counts, safe_filename, zip_pdfs)
+import usage_stats
 from report import api_usage, build_report, load_report, report_name_part, save_report
 
 
@@ -270,6 +271,7 @@ def main(argv=None):
 
         results = []
         audit_calls = client.call_count        # the company lookup counts as audit
+        step_calls = 0
         for asm_pn in args.assemblies:
             print(f"Auditing {asm_pn} ...")
             calls_before = client.call_count
@@ -324,6 +326,7 @@ def main(argv=None):
                 }
 
             if step_dir and result.get("assembly"):
+                step_before = client.call_count
                 print(f"  exporting STEP file to {step_dir} ...")
                 try:
                     entry = export_assembly_step_file(client, result, Path(step_dir),
@@ -339,6 +342,7 @@ def main(argv=None):
                 elif entry:
                     print(f"    exported to {entry['path']}")
                 result["stepExport"] = entry
+                step_calls += client.call_count - step_before
 
             results.append(result)
     except OnshapeError as exc:
@@ -348,11 +352,13 @@ def main(argv=None):
         print("\nInterrupted.", file=sys.stderr)
         return 130
 
-    usage = api_usage(results, client.call_count, client.cached_count, audit_calls)
+    usage = api_usage(results, client.call_count, client.cached_count, audit_calls,
+                      step_calls)
     print(f"\n{usage['calls']} API calls (audit {usage['auditCalls']}, "
           f"exports {usage['exportCalls']})"
           + (f", {usage['cached']} repeat lookups answered from memory"
              if usage["cached"] else "") + "\n")
+    usage_stats.record(usage)
     print("Results")
     print("-" * 60)
     for result in results:

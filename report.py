@@ -475,10 +475,11 @@ def build_report(results, base_url, folder_notes=None, generated=None, api=None)
     }
 
 
-def api_usage(results, calls, cached, audit_calls=None):
+def api_usage(results, calls, cached, audit_calls=None, step_calls=None):
     """{"calls", "cached", "auditCalls", "exportCalls", "assemblies", "parts"}
     for one run. calls/cached are this run's share of the client's counters;
-    audit_calls splits off the export round trips when the caller knows it."""
+    audit_calls splits off the export round trips when the caller knows it;
+    step_calls then splits those into STEP (stepCalls) and drawing PDFs (pdfCalls)."""
     usage = {
         "calls": calls,
         "cached": cached,
@@ -488,6 +489,9 @@ def api_usage(results, calls, cached, audit_calls=None):
     if audit_calls is not None:
         usage["auditCalls"] = audit_calls
         usage["exportCalls"] = calls - audit_calls
+        if step_calls is not None:
+            usage["stepCalls"] = step_calls
+            usage["pdfCalls"] = usage["exportCalls"] - step_calls
     return usage
 
 

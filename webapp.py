@@ -28,6 +28,7 @@ from fsutil import write_atomic
 from onshape_client import OnshapeError
 from pdf_export import (export_assembly_drawings, export_assembly_step_file,
                         export_counts, zip_pdfs)
+import usage_stats
 from report import APP_NAME, CSS, api_usage, api_usage_line, asset, build_report, credit_html
 from report_store import (find_report, list_reports, new_report_id, newest_first, report_id,
                           report_label, write_report)
@@ -403,12 +404,15 @@ def run_audit(client, company_id, names, values, who=None):
 
 
 def run_exports(results, client, host, values):
-    """The PDF and STEP exports the form asked for, attached to results."""
+    """The PDF and STEP exports the form asked for, attached to results.
+    Returns how many API calls the STEP export took, for the usage split."""
     force = bool(values.get("force_export"))
     if values.get("export_drawings") and values.get("pdf_dir"):
         export_drawings_for(results, client, host, values["pdf_dir"], force=force)
+    step_before = client.usage()[0]
     if values.get("export_step") and values.get("step_dir"):
         export_step_for(results, client, host, values["step_dir"], force=force)
+    return client.usage()[0] - step_before
 
 
 def _export_failed(result, what, exc):
@@ -505,10 +509,11 @@ def audit_and_report(client, company_id, names, values, host, base_url, who=None
     calls0, cached0 = client.usage()
     results = run_audit(client, company_id, names, values, who)
     audit_calls = client.usage()[0] - calls0
-    run_exports(results, client, host, values)
+    step_calls = run_exports(results, client, host, values)
     calls1, cached1 = client.usage()
-    api = api_usage(results, calls1 - calls0, cached1 - cached0, audit_calls)
+    api = api_usage(results, calls1 - calls0, cached1 - cached0, audit_calls, step_calls)
     print(f"  {api_usage_line(api)}", file=sys.stderr)
+    usage_stats.record(api)
     data = build_report(results, base_url, folder_notes_for(values), api=api)
     rid = new_report_id(names)
     saved = write_report(rid, data)             # configured folder, or app folder
@@ -572,10 +577,10 @@ def form_page(values=None, error=None, report_names=None):
     v = values or {}
     asm = html.escape(v.get("assemblies", ""))
     pdf_default, step_default = default_dir("pdf"), default_dir("step")
-    # Exports default to on whenever their folder is configured - a re-run
-    # costs nothing for files already there - and follow the form on a resubmit.
-    export_drawings = v.get("export_drawings", bool(pdf_default))
-    export_step = v.get("export_step", bool(step_default))
+    # Exports default to off for now (they are most of the API calls); the
+    # boxes follow the form on a resubmit.
+    export_drawings = v.get("export_drawings", False)
+    export_step = v.get("export_step", False)
 
     if report_names is None:
         reports = list_reports(5)
@@ -654,6 +659,7 @@ def form_page(values=None, error=None, report_names=None):
           Each drawing not yet in the PDF folder takes a few seconds on top.</div>
       </form>
       {recent}
+      {usage_stats.stats_html()}
       <footer>{credit_html()}</footer>
       <script>{FORM_JS}</script>
     """)
